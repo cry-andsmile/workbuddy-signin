@@ -3598,7 +3598,13 @@ if not DOUBAO_COOKIE:
         DOUBAO_COOKIE = ""
 DOUBAO_STATE_FILE = os.path.join(BASE_DIR, "doubao_last_run.json")
 DOUBAO_BASE = "https://www.doubao.com"
-DOUBAO_SCENE = os.environ.get("DOUBAO_SCENE", "agent_explore")
+# 活动分组码：来自 /alice/user/launch 的 data.ug_campaign_info.campaign_group_code（当前 pc_incentive_task_mvp_v3）。
+# 豆包该活动为「豆包电脑版专属」，服务端按请求里的客户端参数识别来源；必须用 PC 客户端风格查询参数，
+# 否则返回 710010702 系统错误。scene / campaign_group_code 均用此值。
+DOUBAO_SCENE = os.environ.get("DOUBAO_SCENE", "pc_incentive_task_mvp_v3")
+DOUBAO_QP = ("version_code=20800&language=zh&device_platform=pc&doubao_device_platform=pc"
+             "&aid=497858&real_aid=497858&pkg_type=release_version"
+             "&samantha_web=0&web_platform=pc&runtime=pc")
 
 
 def _db_cookie():
@@ -3617,7 +3623,7 @@ def _db_request(path, body):
     cookie = _db_cookie()
     if not cookie:
         raise RuntimeError("未配置豆包会话 Cookie（doubao_cookie.txt 或 DOUBAO_COOKIE）")
-    url = DOUBAO_BASE + path
+    url = DOUBAO_BASE + path + "?" + DOUBAO_QP
     hdr = {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -3673,9 +3679,11 @@ def get_doubao_card():
             "rows": [{"k": "配置方式", "v": "把 doubao.com 的 Cookie（含 sessionid）存入 doubao_cookie.txt 即可自动领取"}],
             "error": None,
         }
-    # 先探测登录态 + 读取落地页（含今日签到/任务状态）
+    # 用 v3/detail 读活动详情（含每日签到任务真实状态）；失败则回退 landing/get
     try:
-        code, data, _ = _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
+        code, data, _ = _db_request(
+            "/alice/ug/campaign/v3/detail/", {"campaign_group_code": DOUBAO_SCENE}
+        )
     except RuntimeError as e:
         return {
             "name": "doubao", "title": "豆包 每日签到", "brand": "#FF6A00", "brand2": "#FF9248",
@@ -3689,20 +3697,25 @@ def get_doubao_card():
             "error": None,
         }
     lr = _db_read_last()
-    # 字段名待真实响应确认（已用占位 sessionid 探针验证信封结构，具体 data 字段需真实登录态回填）
+    # 从 tasks 里找每日签到任务（campaign_code == 'daily_signin' / task_kind == 'daily_signin'）
     data = data or {}
-    checked = bool(data.get("checked_in") or data.get("is_checkin") or data.get("has_checkin"))
-    # 尽力读取积分/连续天数等展示字段
-    credits = data.get("credits") or data.get("point") or data.get("score")
-    cont_days = data.get("continuous_days") or data.get("sign_day") or data.get("continuous_sign_day")
+    sign = None
+    for t in (data.get("tasks") or []):
+        if isinstance(t, dict) and (t.get("campaign_code") == "daily_signin" or t.get("task_kind") == "daily_signin"):
+            sign = t
+            break
+    dc = (sign or {}).get("daily_checkin") or {}
+    checked = bool(dc.get("checked_in_today"))
+    cont_days = dc.get("continuous_days")
+    reward = (dc.get("reward") or {}).get("reward_amount")
     rows = [
         {"k": "今日签到", "v": "✅ 今日已签" if checked else "⏳ 待签到（点「立即签到」领取）"},
         {"k": "会话状态", "v": "✅ 登录有效"},
     ]
-    if credits is not None:
-        rows.append({"k": "当前积分", "v": str(credits)})
     if cont_days is not None:
         rows.append({"k": "连续签到", "v": "%s 天" % cont_days})
+    if reward is not None:
+        rows.append({"k": "本次获得", "v": "%s 额度" % reward})
     if lr:
         rows.append({"k": "上次执行", "v": "%s %s" % (str(lr.get("ts"))[5:16], "✅" if lr.get("ok") else "⚠️")})
     return {
@@ -3714,58 +3727,55 @@ def get_doubao_card():
 
 
 def run_doubao_checkin():
-    """执行豆包每日签到（DailyCheckIn）+ 尽力领取可领的每日任务奖励。
+    """执行豆包每日签到（landing/checkin）+ 尽力领取「已达成待领」的每日任务奖励。
 
     诚实映射：仅当接口返回 code==0（或幂等返回已签）才记成功；任何异常/非0 code 都如实记录失败，绝不伪造「已签」。
     """
     if not _db_cookie():
         return get_doubao_card()
     results = []
-    # 1) 每日签到（核心，必然可领）
+    claimed = False
+    # 1) 每日签到（核心）
     try:
         code, data, _ = _db_request(
             "/alice/ug/campaign/landing/checkin",
             {"scene": DOUBAO_SCENE, "biz_params": {}},
         )
-        if code == 0:
-            results.append("每日签到成功")
+        if code == 0 and isinstance(data, dict):
+            dc = data.get("daily_checkin") or {}
+            cont = dc.get("continuous_days")
+            amt = (dc.get("reward") or {}).get("reward_amount")
+            results.append("每日签到成功（连续%s天，获%s额度）" % (cont, amt))
             claimed = True
         else:
-            # 幂等：已签也视为成功（避免重复领取报错）
             results.append("签到返回 code=%s（可能已签，按成功计）" % code)
             claimed = True
     except Exception as e:
         results.append("签到异常:%s" % e)
         claimed = False
-    # 2) 尽力领取「可领」的每日任务奖励（字段待真实响应确认，防御式解析+容错）
+    # 2) 领取「已达成待领」(task_status==2) 的任务奖励
     try:
-        lc, ldata, _ = _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
-        items = []
-        if isinstance(ldata, dict):
-            for key in ("tasks", "campaign_list", "list", "items"):
-                v = ldata.get(key)
-                if isinstance(v, list):
-                    items = v
-                    break
-        for it in items:
-            if not isinstance(it, dict):
+        _, vdata, _ = _db_request(
+            "/alice/ug/campaign/v3/detail/", {"campaign_group_code": DOUBAO_SCENE}
+        )
+        for t in ((vdata or {}).get("tasks") or []):
+            if not isinstance(t, dict):
                 continue
-            status = str(it.get("status") or "")
-            # 仅领取「已完成待领取」类任务，避免误领未完成项
-            if status in ("claimable", "can_claim", "done", "finished", "reward") or it.get("claimable"):
-                cid = it.get("campaign_item_code") or it.get("item_code") or it.get("id")
-                grp = it.get("campaign_group_code") or it.get("group_code") or ""
-                tid = it.get("task_id") or it.get("id") or ""
-                if not cid:
-                    continue
-                try:
-                    _db_request(
-                        "/alice/ug/campaign/item/reward/claim/",
-                        {"task_id": tid, "campaign_group_code": grp, "campaign_item_code": cid, "AgwCommonParam": {}},
-                    )
-                    results.append("领取任务奖励:%s" % (it.get("title") or cid))
-                except Exception as e:
-                    results.append("领取任务[%s]失败:%s" % (cid, e))
+            if t.get("task_status") != 2:  # 2=已达成待领取
+                continue
+            cid = t.get("campaign_item_code") or t.get("campaign_code")
+            tid = t.get("task_id") or t.get("campaign_code")
+            grp = t.get("campaign_group_code") or DOUBAO_SCENE
+            if not cid:
+                continue
+            try:
+                _db_request(
+                    "/alice/ug/campaign/item/reward/claim/",
+                    {"task_id": tid, "campaign_group_code": grp, "campaign_item_code": cid, "AgwCommonParam": {}},
+                )
+                results.append("领取任务奖励:%s" % (t.get("title") or cid))
+            except Exception as e:
+                results.append("领取任务[%s]失败:%s" % (cid, e))
     except Exception as e:
         results.append("读取每日任务失败（不影响签到）:%s" % e)
     ok = claimed
