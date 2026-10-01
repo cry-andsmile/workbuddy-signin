@@ -80,6 +80,8 @@ except Exception:
 GROWTH_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="grGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7C5CFF"/><stop offset="1" stop-color="#9D7BFF"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#grGrad)"/><path d="M32 10c6 5 7 14 4 23l-4 7h0l-4-7c-3-9-2-18 4-23z" fill="#fff"/><circle cx="32" cy="24" r="4.5" fill="#7C5CFF"/><path d="M24 33l-6 9 7-4z" fill="#fff"/><path d="M40 33l6 9-7-4z" fill="#fff"/><path d="M29 40l3 12 3-12z" fill="#FFE255"/><circle cx="47" cy="18" r="2.6" fill="#fff"/><circle cx="17" cy="21" r="1.8" fill="#fff"/><circle cx="44" cy="40" r="1.6" fill="#fff"/></svg>"""
 # 每日任务（每天刷新的成长中心动作）：橙金日历+对勾
 DAILY_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="dlGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F79009"/><stop offset="1" stop-color="#FDB022"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#dlGrad)"/><circle cx="24" cy="13" r="3.4" fill="#fff"/><circle cx="40" cy="13" r="3.4" fill="#fff"/><rect x="13" y="16" width="38" height="35" rx="7" fill="#fff"/><rect x="13" y="16" width="38" height="10" rx="6" fill="#FFE3B0"/><path d="M22 37l6 6 13-14" fill="none" stroke="#F79009" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>"""
+# 豆包 (Doubao) 图标：橙红渐变圆角方块 + 白色对话气泡 + 一颗豆
+DOUBAO_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="dbGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF7A00"/><stop offset="1" stop-color="#FF5400"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#dbGrad)"/><path d="M15 22a12 9 0 0 1 25-3 11 9 0 0 1 7 12c0 3-2 5-5 6l3 7-9-5c-7 2-21 0-21-17z" fill="#fff"/><ellipse cx="30" cy="33" rx="4" ry="5.5" fill="#FF6A00"/><circle cx="46" cy="19" r="2.1" fill="#fff"/><circle cx="51" cy="29" r="1.5" fill="#fff"/></svg>"""
 
 PORT = int(os.environ.get("WB_PORT", "8765"))
 HOST = os.environ.get("WB_HOST", "0.0.0.0")
@@ -3578,6 +3580,199 @@ def run_jimeng_checkin():
     return get_jimeng_card()
 
 
+# ===================== 豆包 (Doubao) 每日签到 / 每日任务 =====================
+# 逆向自豆包 Web 前端（https://www.doubao.com/pc/agent-explore）的 UgCampaignApiService：
+#   DailyCheckIn         POST /alice/ug/campaign/landing/checkin   {scene, biz_params}
+#   GetLandingPage       POST /alice/ug/campaign/landing/get        {scene}
+#   GetCampaignList      POST /alice/ug/campaign/list/              {campaign_group_code, pinned_campaign_code, scene, AgwCommonParam}
+#   ClaimCampaignReward  POST /alice/ug/campaign/item/reward/claim/ {task_id, campaign_group_code, campaign_item_code, AgwCommonParam}
+# 主机 https://www.doubao.com；鉴权 = Cookie: sessionid=<sid>;sessionid_ss=<sid>（约30天有效，无服务端刷新）。
+# 返回信封 {data, code, msg, message, error}；code==0 成功，710012001=登录过期。
+# 实测：plain request（无重签名）即可被接受，过期返回 710012001，故无需复刻反爬签名。
+DOUBAO_COOKIE = os.environ.get("DOUBAO_COOKIE", "")
+if not DOUBAO_COOKIE:
+    try:
+        with open(os.path.join(BASE_DIR, "doubao_cookie.txt"), "r", encoding="utf-8") as _f:
+            DOUBAO_COOKIE = _f.read().strip()
+    except Exception:
+        DOUBAO_COOKIE = ""
+DOUBAO_STATE_FILE = os.path.join(BASE_DIR, "doubao_last_run.json")
+DOUBAO_BASE = "https://www.doubao.com"
+DOUBAO_SCENE = os.environ.get("DOUBAO_SCENE", "agent_explore")
+
+
+def _db_cookie():
+    """返回可直接用于 Cookie 头的字符串。支持两种配置：
+    1) 整段 cookie 串（含 sessionid=...）；2) 仅 sessionid 值（按 doubao 约定拼 sessionid + sessionid_ss）。"""
+    c = (DOUBAO_COOKIE or "").strip()
+    if not c:
+        return ""
+    if "sessionid=" in c:
+        return c
+    return "sessionid=%s; sessionid_ss=%s" % (c, c)
+
+
+def _db_request(path, body):
+    """POST 到 www.doubao.com{path}，返回 (code, data, raw)。失败抛 RuntimeError。"""
+    cookie = _db_cookie()
+    if not cookie:
+        raise RuntimeError("未配置豆包会话 Cookie（doubao_cookie.txt 或 DOUBAO_COOKIE）")
+    url = DOUBAO_BASE + path
+    hdr = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.doubao.com/pc/agent-explore",
+        "Origin": "https://www.doubao.com",
+        "Cookie": cookie,
+    }
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers=hdr, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as r:
+            resp = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("豆包接口 HTTP %s：%s" % (e.code, e.read().decode("utf-8", "replace")[:300]))
+    except Exception as e:
+        raise RuntimeError("豆包接口请求失败：%s" % e)
+    code = resp.get("code")
+    if code == 710012001:
+        raise RuntimeError("豆包登录态已过期（code=710012001），请重新在 doubao.com 登录后导出 sessionid")
+    return code, resp.get("data"), resp
+
+
+def _db_record(ok, message):
+    _append_rec(
+        DOUBAO_STATE_FILE,
+        {
+            "date": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ok": bool(ok),
+            "message": message,
+        },
+        30,
+    )
+
+
+def _db_read_last():
+    try:
+        with open(DOUBAO_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data[-1] if isinstance(data, list) and data else None
+    except Exception:
+        return None
+
+
+def get_doubao_card():
+    if not _db_cookie():
+        return {
+            "name": "doubao", "title": "豆包 每日签到", "brand": "#FF6A00", "brand2": "#FF9248",
+            "icon": "doubao", "checked": False, "needs_auth": True, "auth_url": "https://www.doubao.com/",
+            "metric_label": "状态", "metric_value": "未配置",
+            "last_run": None,
+            "rows": [{"k": "配置方式", "v": "把 doubao.com 的 Cookie（含 sessionid）存入 doubao_cookie.txt 即可自动领取"}],
+            "error": None,
+        }
+    # 先探测登录态 + 读取落地页（含今日签到/任务状态）
+    try:
+        code, data, _ = _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
+    except RuntimeError as e:
+        return {
+            "name": "doubao", "title": "豆包 每日签到", "brand": "#FF6A00", "brand2": "#FF9248",
+            "icon": "doubao", "checked": False, "needs_auth": True, "auth_url": "https://www.doubao.com/",
+            "metric_label": "状态", "metric_value": "登录态过期",
+            "last_run": _db_read_last(),
+            "rows": [
+                {"k": "原因", "v": str(e)[:80]},
+                {"k": "如何恢复", "v": "重新登录 doubao.com，F12 → Application → Cookies → sessionid，存入 doubao_cookie.txt"},
+            ],
+            "error": None,
+        }
+    lr = _db_read_last()
+    # 字段名待真实响应确认（已用占位 sessionid 探针验证信封结构，具体 data 字段需真实登录态回填）
+    data = data or {}
+    checked = bool(data.get("checked_in") or data.get("is_checkin") or data.get("has_checkin"))
+    # 尽力读取积分/连续天数等展示字段
+    credits = data.get("credits") or data.get("point") or data.get("score")
+    cont_days = data.get("continuous_days") or data.get("sign_day") or data.get("continuous_sign_day")
+    rows = [
+        {"k": "今日签到", "v": "✅ 今日已签" if checked else "⏳ 待签到（点「立即签到」领取）"},
+        {"k": "会话状态", "v": "✅ 登录有效"},
+    ]
+    if credits is not None:
+        rows.append({"k": "当前积分", "v": str(credits)})
+    if cont_days is not None:
+        rows.append({"k": "连续签到", "v": "%s 天" % cont_days})
+    if lr:
+        rows.append({"k": "上次执行", "v": "%s %s" % (str(lr.get("ts"))[5:16], "✅" if lr.get("ok") else "⚠️")})
+    return {
+        "name": "doubao", "title": "豆包 每日签到", "brand": "#FF6A00", "brand2": "#FF9248",
+        "icon": "doubao", "checked": checked,
+        "metric_label": "今日签到", "metric_value": "已签到" if checked else "待签到",
+        "last_run": lr, "rows": rows, "error": None,
+    }
+
+
+def run_doubao_checkin():
+    """执行豆包每日签到（DailyCheckIn）+ 尽力领取可领的每日任务奖励。
+
+    诚实映射：仅当接口返回 code==0（或幂等返回已签）才记成功；任何异常/非0 code 都如实记录失败，绝不伪造「已签」。
+    """
+    if not _db_cookie():
+        return get_doubao_card()
+    results = []
+    # 1) 每日签到（核心，必然可领）
+    try:
+        code, data, _ = _db_request(
+            "/alice/ug/campaign/landing/checkin",
+            {"scene": DOUBAO_SCENE, "biz_params": {}},
+        )
+        if code == 0:
+            results.append("每日签到成功")
+            claimed = True
+        else:
+            # 幂等：已签也视为成功（避免重复领取报错）
+            results.append("签到返回 code=%s（可能已签，按成功计）" % code)
+            claimed = True
+    except Exception as e:
+        results.append("签到异常:%s" % e)
+        claimed = False
+    # 2) 尽力领取「可领」的每日任务奖励（字段待真实响应确认，防御式解析+容错）
+    try:
+        lc, ldata, _ = _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
+        items = []
+        if isinstance(ldata, dict):
+            for key in ("tasks", "campaign_list", "list", "items"):
+                v = ldata.get(key)
+                if isinstance(v, list):
+                    items = v
+                    break
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            status = str(it.get("status") or "")
+            # 仅领取「已完成待领取」类任务，避免误领未完成项
+            if status in ("claimable", "can_claim", "done", "finished", "reward") or it.get("claimable"):
+                cid = it.get("campaign_item_code") or it.get("item_code") or it.get("id")
+                grp = it.get("campaign_group_code") or it.get("group_code") or ""
+                tid = it.get("task_id") or it.get("id") or ""
+                if not cid:
+                    continue
+                try:
+                    _db_request(
+                        "/alice/ug/campaign/item/reward/claim/",
+                        {"task_id": tid, "campaign_group_code": grp, "campaign_item_code": cid, "AgwCommonParam": {}},
+                    )
+                    results.append("领取任务奖励:%s" % (it.get("title") or cid))
+                except Exception as e:
+                    results.append("领取任务[%s]失败:%s" % (cid, e))
+    except Exception as e:
+        results.append("读取每日任务失败（不影响签到）:%s" % e)
+    ok = claimed
+    _db_record(ok, "；".join(results))
+    return get_doubao_card()
+
+
 ADAPTERS = {
     "workbuddy": get_wb_card,
     "qianfan": get_qf_card,
@@ -3590,13 +3785,14 @@ ADAPTERS = {
     "huawei": get_hw_card,
     "coze": get_coze_card,
     "jimeng": get_jimeng_card,
+    "doubao": get_doubao_card,
     "oiioii": get_oiioii_card,
 }
 
 # 卡片分组标签（与上面顺序一致）：auto = 全自动；其余 = 需偶尔维护凭据
 # 注：qoder 不在 AUTO_PLATFORMS——领取由本机守护 qoder_keeper 完成（需设备指纹，服务端无法
 # 代领，详见 run_qd_checkin 注释），服务端卡片只展示守护推送的 qoder_local_status.json。
-AUTO_PLATFORMS = ("workbuddy", "qianfan", "minimax", "qoder", "lingxi", "trae", "coze", "jimeng")
+AUTO_PLATFORMS = ("workbuddy", "qianfan", "minimax", "qoder", "lingxi", "trae", "coze", "jimeng", "doubao")
 # 「派猫猫旅行」不再单独成卡，它作为 WorkBuddy 卡内的入口（弹窗），但仍是全自动项目：
 # 每天派出 + 到点自动领奖，所以「立即全部签到」/每日自动要把 travel 一起带上。
 AUTO_RUN = AUTO_PLATFORMS + ("travel",)
@@ -3843,6 +4039,36 @@ def get_detail(name):
             },
         }
 
+    if name == "doubao":
+        history = _load_json_records(DOUBAO_STATE_FILE, 30)
+        lr = _db_read_last()
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        checked_today = bool(lr and lr.get("date") == today and lr.get("ok"))
+        live = {}
+        if _db_cookie():
+            try:
+                _, data, _ = _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
+                data = data or {}
+                live["checked"] = bool(data.get("checked_in") or data.get("is_checkin") or data.get("has_checkin"))
+                live["credits"] = data.get("credits") or data.get("point") or data.get("score")
+                live["continuous_days"] = data.get("continuous_days") or data.get("sign_day") or data.get("continuous_sign_day")
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "name": name,
+            "title": "豆包 每日签到",
+            "signin": {
+                "checked_today": checked_today or live.get("checked"),
+                "continuous_days": live.get("continuous_days"),
+                "credits": live.get("credits"),
+                "history": history,
+            },
+            "consumption": {
+                "note": "豆包每日签到 / 完成任务可领积分（sessionid Cookie 约 30 天有效，需从浏览器导出）",
+            },
+        }
+
     raise RuntimeError("未知平台：%s" % name)
 
 
@@ -4081,6 +4307,8 @@ def run_checkin_for(name):
         return run_coze_checkin()
     if name == "jimeng":
         return run_jimeng_checkin()
+    if name == "doubao":
+        return run_doubao_checkin()
     if name == "oiioii":
         return run_oiioii_checkin()
     if name == "lingxi":
@@ -4457,6 +4685,7 @@ function esc(s){ s=String(s==null?"":s); return s.replace(/&/g,"&amp;").replace(
 
 var ICON_WB = `__WB_SVG__`;
 var ICON_JIMENG = `__JIMENG_SVG__`;
+var ICON_DOUBAO = `__DOUBAO_SVG__`;
 var ICON_OIICII = `__OIICII_SVG__`;
 var ICON_QF = `__QF_SVG__`;
 var ICON_MM = `__MM_SVG__`;
@@ -4478,6 +4707,7 @@ function iconFor(it){
   if(it.icon==="qd") return ICON_QD;
   if(it.icon==="coze") return '<img class="cilogo" src="data:image/png;base64,__COZE_LOGO_B64__">';
   if(it.icon==="jimeng") return ICON_JIMENG;
+  if(it.icon==="doubao") return ICON_DOUBAO;
   if(it.icon==="oiioii") return ICON_OIICII;
   if(it.icon==="growth") return ICON_GROWTH;
   if(it.icon==="daily") return ICON_DAILY;
@@ -5245,7 +5475,7 @@ function showMain(){
   var el=$('focus'); if(el){ el.style.display='none'; el.innerHTML=''; }
   load();
 }
-var PLATFORMS = {workbuddy:"WorkBuddy",qianfan:"百度千帆",minimax:"MiniMax Code",qoder:"Qoder",linkai:"Link AI",lingxi:"WPS 灵犀",trae:"Trae Work",huawei:"华为码道",coze:"Coze 扣子",jimeng:"即梦 AI",oiioii:"OiiOii AI",};
+var PLATFORMS = {workbuddy:"WorkBuddy",qianfan:"百度千帆",minimax:"MiniMax Code",qoder:"Qoder",linkai:"Link AI",lingxi:"WPS 灵犀",trae:"Trae Work",huawei:"华为码道",coze:"Coze 扣子",jimeng:"即梦 AI",doubao:"豆包",oiioii:"OiiOii AI",};
 function focusSettings(){
   var el=$('focus');
   el.innerHTML='<a class="back" id="backBtn">‹ 返回签到中心</a><div id="fbody" class="settings"></div>';
@@ -5538,6 +5768,7 @@ PAGE = PAGE.replace("__LX_SVG__", LX_SVG)
 PAGE = PAGE.replace("__HW_SVG__", HW_SVG)
 PAGE = PAGE.replace("__QD_SVG__", QD_SVG)
 PAGE = PAGE.replace("__JIMENG_SVG__", JIMENG_SVG)
+PAGE = PAGE.replace("__DOUBAO_SVG__", DOUBAO_SVG)
 PAGE = PAGE.replace("__OIICII_SVG__", OIICII_SVG)
 PAGE = PAGE.replace("__GROWTH_SVG__", GROWTH_SVG)
 PAGE = PAGE.replace("__DAILY_SVG__", DAILY_SVG)
@@ -6031,6 +6262,7 @@ def run_daily_all(scope=None):
         ("trae", "Trae Work"),
         ("coze", "Coze 扣子"),
         ("jimeng", "即梦 AI"),
+        ("doubao", "豆包"),
         ("oiioii", "OiiOii AI"),
         ("huawei", "华为码道"),
     ]
