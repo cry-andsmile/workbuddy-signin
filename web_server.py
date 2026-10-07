@@ -3587,8 +3587,11 @@ def run_jimeng_checkin():
 #   GetCampaignList      POST /alice/ug/campaign/list/              {campaign_group_code, pinned_campaign_code, scene, AgwCommonParam}
 #   ClaimCampaignReward  POST /alice/ug/campaign/item/reward/claim/ {task_id, campaign_group_code, campaign_item_code, AgwCommonParam}
 # 主机 https://www.doubao.com；鉴权 = Cookie: sessionid=<sid>;sessionid_ss=<sid>（约30天有效，无服务端刷新）。
-# 返回信封 {data, code, msg, message, error}；code==0 成功，710012001=登录过期。
-# 实测：plain request（无重签名）即可被接受，过期返回 710012001，故无需复刻反爬签名。
+# 返回信封 {data, code, msg, message, error}；code==0 成功，710012001=登录过期，710010702=系统错误/风控拦截。
+# ⚠️ 实测结论（2026-10-07 重写）：landing/checkin 写接口**不需要 a_bogus 反爬签名**！
+#   用豆包电脑版客户端全套请求头（含 sec-ch-ua / Sec-Fetch-* / x-requested-with + Edge UA）直调即返回 code:0。
+#   早前判定的「必须 a_bogus、服务端无法代签」是误判——彼时 710010702 源于头不全 + gzip 未解压导致的解析异常。
+#   故服务端可真实代签；仅已签当日返回 idempotent:true（幂等成功，如实回报）。
 DOUBAO_COOKIE = os.environ.get("DOUBAO_COOKIE", "")
 if not DOUBAO_COOKIE:
     try:
@@ -3619,16 +3622,29 @@ def _db_cookie():
 
 
 def _db_request(path, body):
-    """POST 到 www.doubao.com{path}，返回 (code, data, raw)。失败抛 RuntimeError。"""
+    """POST 到 www.doubao.com{path}，返回 (code, data, raw)。失败抛 RuntimeError。
+    模拟豆包电脑版客户端全套请求头（sec-ch-ua / Sec-Fetch-* / x-requested-with + Edge UA），
+    写接口（landing/checkin）同样可用，无需 a_bogus 反爬签名。"""
     cookie = _db_cookie()
     if not cookie:
         raise RuntimeError("未配置豆包会话 Cookie（doubao_cookie.txt 或 DOUBAO_COOKIE）")
     url = DOUBAO_BASE + path + "?" + DOUBAO_QP
     hdr = {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        # 豆包电脑版客户端（Windows / Edge 124）真实 UA —— 缺则 710010702 风控拦截
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "sec-ch-ua": '"Not-A.Brand";v="99", "Chromium";v="124"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
         "Referer": "https://www.doubao.com/pc/agent-explore",
         "Origin": "https://www.doubao.com",
+        "x-requested-with": "XMLHttpRequest",
         "Cookie": cookie,
     }
     req = urllib.request.Request(
@@ -3636,9 +3652,18 @@ def _db_request(path, body):
     )
     try:
         with urllib.request.urlopen(req, timeout=30, context=_SSL_CTX) as r:
-            resp = json.loads(r.read().decode("utf-8", "replace"))
+            raw = r.read()
+            enc = r.headers.get("Content-Encoding", "")
+            if "gzip" in enc:
+                import gzip as _g
+                raw = _g.decompress(raw)
+            elif "deflate" in enc:
+                import zlib as _z
+                raw = _z.decompress(raw)
+            resp = json.loads(raw.decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError("豆包接口 HTTP %s：%s" % (e.code, e.read().decode("utf-8", "replace")[:300]))
+        _b = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError("豆包接口 HTTP %s：%s" % (e.code, _b))
     except Exception as e:
         raise RuntimeError("豆包接口请求失败：%s" % e)
     code = resp.get("code")
