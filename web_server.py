@@ -3709,9 +3709,11 @@ def get_doubao_card():
     cont_days = dc.get("continuous_days")
     reward = (dc.get("reward") or {}).get("reward_amount")
     rows = [
-        {"k": "今日签到", "v": "✅ 今日已签" if checked else "⏳ 待签到（点「立即签到」领取）"},
+        {"k": "今日签到", "v": "✅ 今日已签" if checked else "⏳ 待签到（豆包限定 PC 客户端）"},
         {"k": "会话状态", "v": "✅ 登录有效"},
     ]
+    if not checked:
+        rows.append({"k": "如何签到", "v": "豆包签到为电脑版客户端专属活动，网页端无签到入口；请在豆包电脑版客户端签到，本卡片会自动同步为已签"})
     if cont_days is not None:
         rows.append({"k": "连续签到", "v": "%s 天" % cont_days})
     if reward is not None:
@@ -3729,27 +3731,40 @@ def get_doubao_card():
 def run_doubao_checkin():
     """执行豆包每日签到（landing/checkin）+ 尽力领取「已达成待领」的每日任务奖励。
 
-    诚实映射：仅当接口返回 code==0（或幂等返回已签）才记成功；任何异常/非0 code 都如实记录失败，绝不伪造「已签」。
+    诚实映射：仅当接口返回 code==0（含幂等已签 idempotent）才记成功；任何非0 code（如 710010702
+    系统错误、710012001 登录过期）或异常都如实记录失败，绝不伪造「已签」。
     """
     if not _db_cookie():
         return get_doubao_card()
     results = []
     claimed = False
-    # 1) 每日签到（核心）
+    # 0) 进入活动（客户端每次进页面都会先调 landing/get，服务端补齐这一步，避免「未进入活动」被拦）
+    try:
+        _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
+    except Exception:
+        pass  # 进入活动失败不致命，继续尝试签到
+    # 1) 每日签到（核心）。body 严格对齐客户端 DailyCheckIn({scene})。
     try:
         code, data, _ = _db_request(
             "/alice/ug/campaign/landing/checkin",
-            {"scene": DOUBAO_SCENE, "biz_params": {}},
+            {"scene": DOUBAO_SCENE},
         )
         if code == 0 and isinstance(data, dict):
-            dc = data.get("daily_checkin") or {}
-            cont = dc.get("continuous_days")
-            amt = (dc.get("reward") or {}).get("reward_amount")
-            results.append("每日签到成功（连续%s天，获%s额度）" % (cont, amt))
-            claimed = True
+            # landing/checkin 真实返回：顶层 checked_in / continuous_days / reward_amount / idempotent
+            checked = data.get("checked_in")
+            cont = data.get("continuous_days")
+            amt = data.get("reward_amount")
+            if checked or data.get("idempotent"):
+                results.append("每日签到成功（连续%s天，获%s额度）" % (cont, amt))
+                claimed = True
+            else:
+                # code==0 但接口未确认已签（异常分支），按失败计，不谎报
+                results.append("签到接口返回成功但未确认已签(continuous=%s)，视为未签" % cont)
+                claimed = False
         else:
-            results.append("签到返回 code=%s（可能已签，按成功计）" % code)
-            claimed = True
+            # 非0 code（含 710010702 系统错误）= 真正失败，如实记录
+            results.append("签到失败：接口返回 code=%s（未执行签到）" % code)
+            claimed = False
     except Exception as e:
         results.append("签到异常:%s" % e)
         claimed = False
