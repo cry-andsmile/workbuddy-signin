@@ -3003,7 +3003,7 @@ def _qf_activity_entry():
         if not QIANFAN_TOKEN or not QIANFAN_BASE:
             return {"ok": False, "todo": None}
         d = _http_json(
-            "%s/api/activity?token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), retries=0
+            "%s/api/activity?token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), retries=0, timeout=6
         )
         if not d.get("ok"):
             return {"ok": False, "todo": None}
@@ -3019,7 +3019,7 @@ def get_qf_card():
         if not QIANFAN_TOKEN or not QIANFAN_BASE:
             raise RuntimeError("未配置千帆（请设置 QF_BASE_URL 与 QF_ACCESS_TOKEN）")
         d = _http_json(
-            "%s/api/status?token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), retries=1
+            "%s/api/status?token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), retries=0, timeout=6
         )
         if not d.get("ok"):
             raise RuntimeError(d.get("error") or "千帆状态获取失败")
@@ -3030,7 +3030,7 @@ def get_qf_card():
         last_run = None
         try:
             h = _http_json(
-                "%s/api/history?days=7&token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN)
+                "%s/api/history?days=7&token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), timeout=6
             )
             hs = h.get("data") or []
             if hs:
@@ -3080,7 +3080,7 @@ def get_qf_daily_card():
         if not QIANFAN_TOKEN or not QIANFAN_BASE:
             raise RuntimeError("未配置千帆（请设置 QF_BASE_URL 与 QF_ACCESS_TOKEN）")
         d = _http_json(
-            "%s/api/activity?token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), retries=1
+            "%s/api/activity?token=%s" % (QIANFAN_BASE, QIANFAN_TOKEN), retries=0, timeout=6
         )
         if not d.get("ok"):
             raise RuntimeError(d.get("error") or "活动中心获取失败")
@@ -4271,8 +4271,91 @@ OFFICIAL_SITES = {
 }
 
 
+def _tc_call(fn, sec):
+    """独立线程里调用 fn，最多等 sec 秒；超时返回 _TC_TIMEOUT 哨兵，异常返回 Exception 实例。"""
+    box = {}
+    def _r():
+        try:
+            box["v"] = fn()
+        except Exception as e:
+            box["e"] = e
+    th = threading.Thread(target=_r, daemon=True)
+    th.start()
+    th.join(sec)
+    if th.is_alive():
+        return _TC_TIMEOUT
+    if "e" in box:
+        return box["e"]
+    return box.get("v")
+
+_TC_TIMEOUT = object()
+
+def _growth_entry():
+    g = get_growth_card()
+    return ({"ok": False, "error": g.get("error")} if g.get("error")
+            else {"ok": True, "completed": g.get("completed"), "total": g.get("total"),
+                  "claimable": g.get("claimable"), "level": g.get("level")})
+
+def _daily_entry():
+    dy = get_daily_card()
+    return ({"ok": False, "error": dy.get("error")} if dy.get("error")
+            else {"ok": True, "todo": dy.get("claimable"), "streak_days": dy.get("streak_days"),
+                  "energy": dy.get("energy")})
+
+def _travel_entry():
+    tc = get_travel_card()
+    if tc.get("needs_auth") or tc.get("error"):
+        return {"ok": False, "error": tc.get("error") or "需要处理"}
+    return {
+        "ok": True,
+        "state": tc.get("travel_state"), "state_cn": tc.get("state_cn"),
+        "metric": tc.get("metric_value"), "checked": bool(tc.get("checked")),
+        "can_depart": bool(tc.get("can_depart")), "can_claim": bool(tc.get("can_claim")),
+        "remain": tc.get("remain"), "location": tc.get("location"),
+    }
+
 def get_center():
-    items = [fn() for fn in ADAPTERS.values()]
+    # 并发拉取各平台卡片 + 子卡，单平台最多 8s；任一平台慢/卡死只标记超时，绝不拖累整页。
+    order = list(ADAPTERS.keys())
+    results, sub = {}, {}
+    lock = threading.Lock()
+
+    def _wk(name, fn):
+        r = _tc_call(fn, 6)
+        if r is _TC_TIMEOUT:
+            card = {"name": name, "checked": False,
+                    "error": "校验超时（平台接口响应过慢，已自动跳过，可稍后刷新）",
+                    "credit": {"balance": None, "unit": "积分"}}
+        elif isinstance(r, Exception):
+            card = {"name": name, "checked": False,
+                    "error": "校验异常：%s" % str(r)[:160],
+                    "credit": {"balance": None, "unit": "积分"}}
+        else:
+            card = r
+        with lock:
+            results[name] = card
+
+    def _sub(key, fn):
+        r = _tc_call(fn, 6)
+        if r is _TC_TIMEOUT:
+            v = {"ok": False, "error": "校验超时"}
+        elif isinstance(r, Exception):
+            v = {"ok": False, "error": str(r)[:160]}
+        else:
+            v = r
+        with lock:
+            sub[key] = v
+
+    threads = [threading.Thread(target=_wk, args=(n, f), daemon=True) for n, f in ADAPTERS.items()]
+    threads.append(threading.Thread(target=_sub, args=("growth", _growth_entry), daemon=True))
+    threads.append(threading.Thread(target=_sub, args=("daily", _daily_entry), daemon=True))
+    threads.append(threading.Thread(target=_sub, args=("travel", _travel_entry), daemon=True))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    items = [results[n] for n in order]
     for it in items:
         if "credit" not in it:
             it["credit"] = {"balance": None, "unit": "积分"}
@@ -4282,38 +4365,7 @@ def get_center():
         if _oname in OFFICIAL_SITES:
             it["official_url"], it["official_label"] = OFFICIAL_SITES[_oname]
     signed = sum(1 for it in items if it.get("checked") and not it.get("disabled"))
-    # 成长中心 / 每日任务 都属于 WorkBuddy：作为 WorkBuddy 卡片内的入口，不单独成卡
-    g_entry = d_entry = None
-    try:
-        g = get_growth_card()
-        g_entry = ({"ok": False, "error": g.get("error")} if g.get("error")
-                   else {"ok": True, "completed": g.get("completed"), "total": g.get("total"),
-                         "claimable": g.get("claimable"), "level": g.get("level")})
-    except Exception as e:
-        g_entry = {"ok": False, "error": str(e)}
-    try:
-        dy = get_daily_card()
-        d_entry = ({"ok": False, "error": dy.get("error")} if dy.get("error")
-                   else {"ok": True, "todo": dy.get("claimable"), "streak_days": dy.get("streak_days"),
-                         "energy": dy.get("energy")})
-    except Exception as e:
-        d_entry = {"ok": False, "error": str(e)}
-    # 「派猫猫旅行」也属于 WorkBuddy：作为 WorkBuddy 卡内的入口（弹窗），不单独成卡
-    t_entry = None
-    try:
-        tc = get_travel_card()
-        if tc.get("needs_auth") or tc.get("error"):
-            t_entry = {"ok": False, "error": tc.get("error") or "需要处理"}
-        else:
-            t_entry = {
-                "ok": True,
-                "state": tc.get("travel_state"), "state_cn": tc.get("state_cn"),
-                "metric": tc.get("metric_value"), "checked": bool(tc.get("checked")),
-                "can_depart": bool(tc.get("can_depart")), "can_claim": bool(tc.get("can_claim")),
-                "remain": tc.get("remain"), "location": tc.get("location"),
-            }
-    except Exception as e:
-        t_entry = {"ok": False, "error": str(e)}
+    g_entry, d_entry, t_entry = sub.get("growth"), sub.get("daily"), sub.get("travel")
     for it in items:
         it["group"] = "auto" if it.get("name") in AUTO_PLATFORMS else "manual"
         if it.get("group") == "manual":
