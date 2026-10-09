@@ -322,23 +322,31 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`[doubao-sign] 服务已启动: http://127.0.0.1:${PORT}  (CORS origin=${ORIGIN})`);
 });
 
-// ---- 每日定时自动签（与主签到中心错峰，默认 08:25）----
-const SCHED_HH = 8, SCHED_MM = 25;
-function scheduleDaily() {
+// ---- 每日定时：自动签到 + 自动领积分（无需人工干预）----
+// 豆包任务本身需王大少在电脑版真实完成（平台校验真实使用），本服务只负责：
+//   1) 每日 08:25 自动签到
+//   2) 每日 08:30 / 20:00 自动领取「已完成任务」的积分（无需开网页）
+function scheduleAt(hh, mm, fn, label) {
   const now = new Date();
   let next = new Date(now);
-  next.setHours(SCHED_HH, SCHED_MM, 0, 0);
+  next.setHours(hh, mm, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
   const delay = next - now;
   setTimeout(async () => {
-    console.log('[doubao-sign] 定时自动签到触发 ...');
-    const r = await doSign();
-    console.log('[doubao-sign] 自动签到结果:', JSON.stringify(r).slice(0, 300));
-    scheduleDaily();
+    try {
+      console.log('[doubao-sign] 定时任务触发: ' + label);
+      const r = await fn();
+      console.log('[doubao-sign] ' + label + ' 结果:', JSON.stringify(r && r.result ? r.result : r).slice(0, 400));
+    } catch (e) {
+      console.error('[doubao-sign] ' + label + ' 出错:', e);
+    }
+    scheduleAt(hh, mm, fn, label);
   }, delay);
-  console.log(`[doubao-sign] 下次自动签到: ${next.toLocaleString()}`);
+  console.log(`[doubao-sign] 下次${label}: ${next.toLocaleString()}`);
 }
-scheduleDaily();
+scheduleAt(8, 25, doSign, '自动签到');
+scheduleAt(8, 30, doTasks, '自动领积分(晨)');
+scheduleAt(20, 0, doTasks, '自动领积分(晚)');
 
 // ---- 中继通道：轮询 112 上的待处理请求（解决 HTTPS 页无法直接 fetch 本机 http 服务）----
 const RELAY_KEY = '19921010';
