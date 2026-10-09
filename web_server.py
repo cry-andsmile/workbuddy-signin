@@ -3755,72 +3755,39 @@ def get_doubao_card():
 
 
 def run_doubao_checkin():
-    """执行豆包每日签到（landing/checkin）+ 尽力领取「已达成待领」的每日任务奖励。
+    """豆包签到。
 
-    诚实映射：仅当接口返回 code==0（含幂等已签 idempotent）才记成功；任何非0 code（如 710010702
-    系统错误、710012001 登录过期）或异常都如实记录失败，绝不伪造「已签」。
+    豆包写接口(landing/checkin)强制要求实时 a_bogus 签名，该签名由豆包前端在真实浏览器里
+    算出来（window.fetch 被包了一层自动加签），服务端裸调复刻不了、会被 710010702 拦下。
+    因此**真正的代签由本机签名服务 doubao_sign.js 完成**（跑在王大少 PC 上，用系统 Edge +
+    登录态实时算签名）。本函数两种模式：
+      - 若配置了 DOUBAO_SIGNER_URL（签名服务与本服务同机时）：调用之做真实签到；
+      - 否则（默认，112 上）：仅读取真实状态，诚实记录，绝不谎报/伪造已签。
+    每日自动签到由本机 doubao_sign.js 的内建定时（默认 08:25，与 112 错峰）负责触发。
     """
-    if not _db_cookie():
-        return get_doubao_card()
-    results = []
-    claimed = False
-    # 0) 进入活动（客户端每次进页面都会先调 landing/get，服务端补齐这一步，避免「未进入活动」被拦）
-    try:
-        _db_request("/alice/ug/campaign/landing/get", {"scene": DOUBAO_SCENE})
-    except Exception:
-        pass  # 进入活动失败不致命，继续尝试签到
-    # 1) 每日签到（核心）。body 严格对齐客户端 DailyCheckIn({scene})。
-    try:
-        code, data, _ = _db_request(
-            "/alice/ug/campaign/landing/checkin",
-            {"scene": DOUBAO_SCENE},
-        )
-        if code == 0 and isinstance(data, dict):
-            # landing/checkin 真实返回：顶层 checked_in / continuous_days / reward_amount / idempotent
-            checked = data.get("checked_in")
-            cont = data.get("continuous_days")
-            amt = data.get("reward_amount")
-            if checked or data.get("idempotent"):
-                results.append("每日签到成功（连续%s天，获%s额度）" % (cont, amt))
-                claimed = True
+    card = get_doubao_card()
+    signer = os.environ.get("DOUBAO_SIGNER_URL", "").strip().rstrip("/")
+    if signer:
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(
+                signer + "/sign", data=b"", headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with _ur.urlopen(req, timeout=120, context=_SSL_CTX) as _r:
+                _j = json.loads(_r.read().decode("utf-8", "replace"))
+            _chk = (_j.get("result") or {}).get("checkin") or {}
+            if _j.get("ok") and isinstance(_chk, dict) and _chk.get("code") == 0:
+                _d = _chk.get("data") or {}
+                _db_record(True, "本机签名服务签到成功（连续%s天，获%s额度）"
+                           % (_d.get("continuous_days"), _d.get("reward_amount")))
             else:
-                # code==0 但接口未确认已签（异常分支），按失败计，不谎报
-                results.append("签到接口返回成功但未确认已签(continuous=%s)，视为未签" % cont)
-                claimed = False
-        else:
-            # 非0 code（含 710010702 系统错误）= 真正失败，如实记录
-            results.append("签到失败：接口返回 code=%s（未执行签到）" % code)
-            claimed = False
-    except Exception as e:
-        results.append("签到异常:%s" % e)
-        claimed = False
-    # 2) 领取「已达成待领」(task_status==2) 的任务奖励
-    try:
-        _, vdata, _ = _db_request(
-            "/alice/ug/campaign/v3/detail/", {"campaign_group_code": DOUBAO_SCENE}
-        )
-        for t in ((vdata or {}).get("tasks") or []):
-            if not isinstance(t, dict):
-                continue
-            if t.get("task_status") != 2:  # 2=已达成待领取
-                continue
-            cid = t.get("campaign_item_code") or t.get("campaign_code")
-            tid = t.get("task_id") or t.get("campaign_code")
-            grp = t.get("campaign_group_code") or DOUBAO_SCENE
-            if not cid:
-                continue
-            try:
-                _db_request(
-                    "/alice/ug/campaign/item/reward/claim/",
-                    {"task_id": tid, "campaign_group_code": grp, "campaign_item_code": cid, "AgwCommonParam": {}},
-                )
-                results.append("领取任务奖励:%s" % (t.get("title") or cid))
-            except Exception as e:
-                results.append("领取任务[%s]失败:%s" % (cid, e))
-    except Exception as e:
-        results.append("读取每日任务失败（不影响签到）:%s" % e)
-    ok = claimed
-    _db_record(ok, "；".join(results))
+                _db_record(False, "本机签名服务返回:%s" % json.dumps(_chk, ensure_ascii=False)[:200])
+        except Exception as e:
+            _db_record(False, "调用本机签名服务失败:%s" % e)
+    else:
+        # 仅读状态（签名服务在王大少本机，112 这里签不了），诚实记录当前是否已签。
+        _checked = bool(card.get("checked"))
+        _db_record(_checked, "本机签名服务未配置(112)：仅读取状态（已签=%s）" % _checked)
     return get_doubao_card()
 
 
@@ -5825,6 +5792,24 @@ function markCardErr(name,msg){
 }
 function doCheckin(name,btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>签到中…'; }
+  // 豆包：签到写接口需浏览器实时算 a_bogus，服务端无法代签 —— 改调本机签名服务（同机常驻）。
+  if(name==="doubao"){
+    fetch("http://127.0.0.1:8791/doubao/sign",{method:"POST"}).then(function(r){return r.json();}).then(function(j){
+      if(j && j.ok){
+        load(function(){ showMsg("豆包已通过本机签名服务签到 ✅", "ok"); });
+      } else {
+        var em = (j&&j.error) ? j.error : "本机签名服务无响应";
+        // 本机服务不可达：回退服务端（只读状态）
+        api("api/center/checkin?name=doubao",{method:"POST"}).then(function(d){
+          load(function(){ showMsg("本机签名失败："+em+"（请确认 doubao_signer.bat 已运行）","err"); markCardErr(name,em); });
+        }).catch(function(){ load(function(){ showMsg("本机签名失败："+em,"err"); markCardErr(name,em); }); });
+      }
+    }).catch(function(){
+      // 跨域/服务未启动：回退服务端只读 + 提示
+      load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端签到","err"); markCardErr(name,"本机签名服务未运行"); });
+    });
+    return;
+  }
   api("api/center/checkin?name="+encodeURIComponent(name),{method:"POST"}).then(function(d){
     var ok = !!d.ok;
     var msg = ok ? ((d.card&&d.card.title?d.card.title:"签到")+" 已更新 ✅") : (d.error||"签到失败");

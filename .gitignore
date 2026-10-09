@@ -36,6 +36,7 @@ hw_need_login.flag
 hw_profile/
 trae_profile/
 hw_probe_profile/
+doubao_profile/
 
 # 抓取/调试产物
 hw_capture.log
@@ -100,6 +101,8 @@ _t_*.out
 
 # 无头浏览器验证脚本 / 截图（一次性自检产物）
 _verify_*
+# 豆包签名服务运行日志（运行态）
+doubao_sign.log
 
 # Trae 限流重试持久化状态（运行态，重启后由服务自动恢复）
 trae_retry_state.json
