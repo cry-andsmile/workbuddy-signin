@@ -164,12 +164,98 @@ async function doTasks() {
           out.skipped++; out.tasks.push({ title: t.title || t.name || task_id, status: 'skip_no_params', task_id, campaign_item_code });
           continue;
         }
-        const r = await post('/alice/ug/campaign/item/reward/claim/', { task_id, campaign_group_code, campaign_item_code, AgwCommonParam });
+        // 尽力带上豆包可能需要的附属字段（不确定哪些必填，多带不亏，便于一次成功）
+        const body = { task_id, campaign_group_code, campaign_item_code, AgwCommonParam };
+        if (t.biz_params) body.biz_params = t.biz_params;
+        if (t.extend) body.extend = t.extend;
+        if (t.extra) body.extra = t.extra;
+        if (t.scene) body.scene = t.scene;
+        const r = await post('/alice/ug/campaign/item/reward/claim/', body);
         const ok = r && r.code === 0;
         if (ok) out.claimed++; else out.failed++;
         out.tasks.push({ title: t.title || t.name || task_id, status: ok ? 'claimed' : ('fail:' + (r && r.code)), code: r && r.code, msg: (r && (r.msg || r.message)) || '' });
       }
       return out;
+    }, { SCENE, QP });
+
+    await page.close();
+    return { ok: true, result };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  } finally {
+    _signing = false;
+  }
+}
+
+// 读取任务列表（含每日签到），用于弹窗展示「当前有哪几个任务、各自状态」。
+// 必须在真实浏览器内拉（登录态 + a_bogus），故与签到/领取同源。
+async function getTaskList() {
+  if (_signing) return { ok: false, error: '浏览器忙，请稍候' };
+  _signing = true;
+  let ctx;
+  try {
+    ctx = await getBrowser();
+    const page = await ctx.newPage();
+    const cookie = loadCookieHeader();
+    if (cookie) {
+      const sid = (cookie.match(/sessionid=([^;]+)/) || [])[1];
+      if (sid) {
+        await ctx.addCookies([
+          { name: 'sessionid', value: sid, domain: '.doubao.com', path: '/' },
+          { name: 'sessionid_ss', value: sid, domain: '.doubao.com', path: '/' },
+        ]).catch(() => {});
+      }
+    }
+    await page.goto('https://www.doubao.com/pc/agent-explore', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    for (let i = 0; i < 40; i++) {
+      if (await page.evaluate(() => typeof window.byted_acrawler !== 'undefined').catch(() => false)) break;
+      await page.waitForTimeout(1000);
+    }
+    await page.waitForTimeout(2500);
+
+    const result = await page.evaluate(async (arg) => {
+      const { SCENE, QP } = arg;
+      const base = 'https://www.doubao.com';
+      const headers = { 'Content-Type': 'application/json', 'Referer': base + '/pc/agent-explore', 'Origin': base };
+      const post = async (p, body) => {
+        const r = await fetch(base + p + '?' + QP, { method: 'POST', headers, body: JSON.stringify(body) });
+        const t = await r.text();
+        try { return JSON.parse(t); } catch (e) { return { __raw: t.slice(0, 300) }; }
+      };
+      let detail = await post('/alice/ug/campaign/v3/detail/', { campaign_group_code: SCENE });
+      let tasks = (detail.data && detail.data.tasks) || [];
+      if (!tasks.length) {
+        const lg = await post('/alice/ug/campaign/landing/get', { scene: SCENE });
+        tasks = (lg.data && (lg.data.tasks || lg.data.task_list || [])) || [];
+      }
+      const rewardOf = (t) => {
+        if (typeof t.reward_amount === 'number') return t.reward_amount;
+        if (t.reward && typeof t.reward.reward_amount === 'number') return t.reward.reward_amount;
+        if (typeof t.bonus === 'number') return t.bonus;
+        if (t.reward && typeof t.reward.amount === 'number') return t.reward.amount;
+        return 0;
+      };
+      const claimedOf = (t) => !!(t.claimed || t.is_claimed
+        || ['claimed', 'received', 'done', 'finished', '3'].includes(String(t.status).toLowerCase()));
+      const list = tasks.map((t) => {
+        const isSignin = (t.campaign_code === 'daily_signin' || t.task_kind === 'daily_signin');
+        const rw = rewardOf(t);
+        const claimed = claimedOf(t);
+        const task_id = t.task_id ?? t.id ?? t.item_id;
+        const campaign_item_code = t.campaign_item_code ?? t.item_code ?? t.code ?? t.campaign_item_code;
+        return {
+          title: t.title || t.name || t.task_name || ('任务' + (task_id || '')),
+          kind: isSignin ? 'daily_signin' : (t.task_kind || t.campaign_code || ''),
+          status_raw: t.status,
+          claimed: claimed,
+          reward: rw,
+          claimable: (!isSignin && !claimed && rw > 0 && task_id && campaign_item_code),
+          task_id: task_id,
+          campaign_item_code: campaign_item_code,
+          campaign_group_code: t.campaign_group_code ?? SCENE,
+        };
+      });
+      return { detail_code: detail.code, list, raw: tasks };
     }, { SCENE, QP });
 
     await page.close();
@@ -199,7 +285,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (url === '/' ) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ service: 'doubao-sign', endpoints: ['GET /health', 'POST /sign'], note: '签到中心网页直接调用 /sign' }));
+    res.end(JSON.stringify({ service: 'doubao-sign', endpoints: ['GET /health', 'POST /sign', 'GET /tasks', 'POST /tasks'], note: '签到中心网页直接调用 /sign 或 /tasks' }));
+    return;
+  }
+  if (url === '/tasks' && req.method === 'GET') {
+    // 读取任务列表（用于弹窗展示），不含领取动作
+    const r = await getTaskList();
+    res.writeHead(r.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r));
     return;
   }
   if (url === '/sign' && req.method === 'POST') {

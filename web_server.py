@@ -5793,9 +5793,9 @@ function renderCenter(d){
   Array.prototype.forEach.call(document.querySelectorAll('button.entry[data-qfdaily]'), function(b){
     b.addEventListener('click', function(ev){ if(ev && ev.stopPropagation) ev.stopPropagation(); openQfDaily(); });
   });
-  // 豆包卡内「完成任务」入口 → 一键领取任务积分（与签到同构，走本机签名服务/中继，不打弹窗）
+  // 豆包卡内「完成任务」入口 → 打开弹窗（与 WorkBuddy 每日任务同款：先看任务清单，再一键完成）
   Array.prototype.forEach.call(document.querySelectorAll('button.entry[data-dbtasks]'), function(b){
-    b.addEventListener('click', function(ev){ if(ev && ev.stopPropagation) ev.stopPropagation(); doDoubaoTasks(b); });
+    b.addEventListener('click', function(ev){ if(ev && ev.stopPropagation) ev.stopPropagation(); openDoubaoTasks(); });
   });
   // 重新检查签到状态（只刷新、不执行签到）
   Array.prototype.forEach.call(document.querySelectorAll("button.cta.recheck[data-name]"), function(b){
@@ -5883,31 +5883,101 @@ function relayDoubao(btn){
     load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端签到","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
   });
 }
-function relayDoubaoTasks(btn){
-  // 经 112 中继：网页(Https)写 pending 标志，本机签名服务轮询领取并执行「完成任务 + 领积分」。
-  api("api/doubao/request-tasks",{method:"POST"}).then(function(d){
-    if(d && d.ok){
-      showMsg("已通知本机豆包签名服务，正在领取任务积分，稍候自动刷新…","ok");
-      setTimeout(function(){ load(); }, 20000);
-    } else {
-      load(function(){ showMsg("本机签名服务未运行，请先运行 doubao_signer.bat，或去豆包电脑版客户端完成任务","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
-    }
+function openDoubaoTasks(){
+  var panel = $("modal-panel"); if(panel) panel.style.setProperty("--mc", "#FF6A00");
+  var t = $("modal-title"); if(t) t.textContent = "🎯 豆包 · 每日任务";
+  var m = $("modal"); if(m){ m.classList.add("show"); document.body.style.overflow = "hidden"; }
+  loadDoubaoTasksModal();
+}
+function loadDoubaoTasksModal(){
+  var b = $("modal-body"); if(!b) return;
+  b.innerHTML = '<div class="dloading" style="padding:40px 0"><span class="spin"></span> 读取豆包任务中…</div>';
+  // 任务列表只能从本机签名服务（有效登录态）拿：直连 127.0.0.1:8791/tasks（PC 浏览器 localhost 豁免混合内容）
+  fetch("http://127.0.0.1:8791/tasks",{method:"GET"}).then(function(r){return r.json();}).then(function(d){
+    if(d && d.ok && d.result){ renderDoubaoTasks(d.result); }
+    else { b.innerHTML = doubaoTasksErr("本机签名服务未运行，无法读取任务。请先运行 doubao_signer.bat，或去豆包电脑版完成任务。"); bindDoubaoNotify(b); }
   }).catch(function(){
-    load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端完成任务","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
+    b.innerHTML = doubaoTasksErr("本机签名服务未运行（或手机端无法直连本机服务）。请先在电脑上运行 doubao_signer.bat，或去豆包电脑版完成任务。");
+    bindDoubaoNotify(b);
   });
 }
-function doDoubaoTasks(btn){
-  if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>领取中…'; }
-  // 豆包任务写接口需浏览器实时算 a_bogus，服务端无法代签 —— 与签到同构，改调本机签名服务。
-  // 优先直连本机签名服务（PC 浏览器 + localhost 豁免混合内容）；失败则走 112 中继（轮询，手机端也可用）。
-  fetch("http://127.0.0.1:8791/doubao/tasks",{method:"POST"}).then(function(r){return r.json();}).then(function(j){
-    if(j && j.ok){
-      load(function(){ showMsg("豆包任务积分已通过本机签名服务领取 ✅", "ok"); });
-    } else {
-      relayDoubaoTasks(btn);
-    }
-  }).catch(function(){ relayDoubaoTasks(btn); });
+function doubaoTasksErr(msg){
+  return '<div class="fnote" style="color:#912018">'+esc(msg)+'</div>'
+    + '<button class="btn-mini" id="dbNotify" style="width:100%;padding:12px;margin-top:10px;--c:#FF6A00">📨 通知本机服务（上线后自动领）</button>';
 }
+function bindDoubaoNotify(b){
+  var nb = b.querySelector("#dbNotify");
+  if(nb) nb.addEventListener("click", function(){
+    api("api/doubao/request-tasks",{method:"POST"}).then(function(d){
+      showMsg(d&&d.ok ? "已通知本机服务，上线后自动领" : "通知失败","ok");
+    }).catch(function(){ showMsg("通知失败","err"); });
+  });
+}
+function renderDoubaoTasks(res){
+  var el = $("modal-body"); if(!el) return;
+  var list = (res && res.list) || [];
+  var claimable = list.filter(function(t){ return t.claimable; }).length;
+  var claimed = list.filter(function(t){ return t.claimed; }).length;
+  var reward = list.reduce(function(s,t){ return s + (t.claimable ? (t.reward||0) : 0); }, 0);
+  var html = ''
+    + '<div class="fhead" style="--c:#FF6A00;--c2:#FF9248">'
+    +   '<h2>🎯 豆包 · 每日任务</h2>'
+    +   '<div class="fmeta">在真实浏览器内领取任务积分（需本机签名服务运行）</div>'
+    +   '<div class="fstat">共 '+list.length+' 个任务 · 可领 '+claimable+' 项（约 '+reward+' 额度）· 已领 '+claimed+' 项</div>'
+    + '</div>'
+    + '<button class="btn-mini" id="dbClaimAll" style="width:100%;padding:14px;font-size:15px;--c:#FF6A00;--c2:#FF9248">🎯 一键完成任务</button>'
+    + '<div class="fnote">点「一键完成任务」会在本机浏览器内逐个领取可领任务积分。需豆包电脑版客户端专属的任务可能无法自动领取。</div>';
+  if(list.length){
+    html += '<div class="dtasks">';
+    list.forEach(function(t){
+      var st = t.claimed ? '<span class="st claimed">✅ 已领取</span>'
+            : t.claimable ? '<span class="st todo">🎯 可领取</span>'
+            : '<span class="st">⏳ '+(t.status_raw||'待完成')+'</span>';
+      var meta = [];
+      if(t.kind) meta.push(t.kind);
+      if(t.reward) meta.push(t.reward+' 额度');
+      html += '<div class="task"><div class="tt"><div class="t1">'+esc(t.title)+'</div>'
+        + (meta.length?('<div class="t2">'+esc(meta.join(' · '))+'</div>'):'')
+        + '</div><div class="tr">'+st+'</div></div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="dempty">暂无可显示的任务（本机服务读取到的任务列表为空）</div>';
+  }
+  el.innerHTML = html;
+  var cb = $("dbClaimAll");
+  if(cb) cb.addEventListener("click", function(){ doubaoClaimTasks(cb); });
+}
+function doubaoClaimTasks(btn){
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>领取中…'; }
+  // 优先直连本机签名服务（PC 浏览器 + localhost 豁免混合内容）；失败则走 112 中继（手机端可用）
+  fetch("http://127.0.0.1:8791/tasks",{method:"POST"}).then(function(r){return r.json();}).then(function(j){
+    if(j && j.ok){
+      showMsg("豆包任务积分已领取","ok");
+      loadDoubaoTasksModal();
+      load();
+    } else {
+      relayDoubaoTasksClaim(btn);
+    }
+  }).catch(function(){ relayDoubaoTasksClaim(btn); });
+}
+function relayDoubaoTasksClaim(btn){
+  // 手机端/服务未起：经 112 中继写标志，待本机服务轮询领取
+  api("api/doubao/request-tasks",{method:"POST"}).then(function(d){
+    if(d && d.ok){
+      showMsg("已通知本机豆包服务领取，稍候自动刷新","ok");
+      if(btn){ btn.disabled=false; btn.innerHTML="🎯 一键完成任务"; }
+      loadDoubaoTasksModal();
+    } else {
+      showMsg("本机签名服务未运行，请先运行 doubao_signer.bat","err");
+      if(btn){ btn.disabled=false; btn.innerHTML="🎯 一键完成任务"; }
+    }
+  }).catch(function(){
+    showMsg("本机签名服务未运行，请先运行 doubao_signer.bat","err");
+    if(btn){ btn.disabled=false; btn.innerHTML="🎯 一键完成任务"; }
+  });
+}
+
 function doCheckin(name,btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>签到中…'; }
   // 豆包：签到写接口需浏览器实时算 a_bogus，服务端无法代签 —— 改调本机签名服务（同机常驻）。
