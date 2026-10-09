@@ -125,3 +125,7 @@ qoder_keeper/qoder_keeper.out.log
 qoder_keeper/qoder_state.json
 qoder_local_status.json
 
+# 临时 commit message / 调试脚本（排查接口时临时生成，含密码或非交付物，禁止入库）
+_*.txt
+_*.py
+
