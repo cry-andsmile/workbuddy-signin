@@ -26,6 +26,8 @@ const PORT       = 8791;
 const ORIGIN     = 'https://bjzjsf.asia';
 const SCENE      = 'pc_incentive_task_mvp_v3';
 const QP = 'version_code=20800&language=zh&device_platform=pc&doubao_device_platform=pc&aid=497858&real_aid=497858&pkg_type=release_version&samantha_web=0&web_platform=pc&runtime=pc';
+const LOG = 'E:/workspace/workbuddy-signin/doubao_sign.log';
+function dlog(s){ try { fs.appendFileSync(LOG, '[' + new Date().toISOString() + '] ' + s + '\n'); } catch (e) {} }
 
 function loadCookieHeader() {
   try {
@@ -144,36 +146,32 @@ async function doTasks() {
         tasks = (lg.data && (lg.data.tasks || lg.data.task_list || [])) || [];
       }
       const out = { detail_code: detail.code, task_count: tasks.length, tasks: [], claimed: 0, failed: 0, skipped: 0 };
+      dlog('TASKS_RAW ' + JSON.stringify(tasks).slice(0, 12000));
       for (const t of tasks) {
         // 跳过「每日签到」（由 /sign 处理）
         const isSignin = (t.campaign_code === 'daily_signin' || t.task_kind === 'daily_signin');
         if (isSignin) continue;
-        const rw = (typeof t.reward_amount === 'number') ? t.reward_amount
-                 : (t.reward && typeof t.reward.reward_amount === 'number') ? t.reward.reward_amount
-                 : (typeof t.bonus === 'number') ? t.bonus
-                 : (t.reward && typeof t.reward.amount === 'number') ? t.reward.amount : 0;
-        const claimed = !!(t.claimed || t.is_claimed
-          || ['claimed', 'received', 'done', 'finished', '3'].includes(String(t.status).toLowerCase()));
-        if (claimed) { out.skipped++; out.tasks.push({ title: t.title || t.name || t.task_id || t.id, status: 'already_claimed' }); continue; }
-        if (!rw || rw <= 0) { out.skipped++; out.tasks.push({ title: t.title || t.name || t.task_id || t.id, status: 'no_reward' }); continue; }
-        const task_id = t.task_id ?? t.id ?? t.item_id;
+        const rw = (Array.isArray(t.reward_summaries) && t.reward_summaries.length)
+          ? t.reward_summaries.reduce((s, x) => s + (x.reward_amount || 0), 0)
+          : (typeof t.reward_amount === 'number' ? t.reward_amount
+            : (t.daily_checkin && t.daily_checkin.reward && typeof t.daily_checkin.reward.reward_amount === 'number') ? t.daily_checkin.reward.reward_amount : 0);
+        const claimed = !!(t.claimed || t.is_claimed || t.reward_status === 3
+          || [3, 'claimed', 'received', 'done', 'finished'].includes(t.task_status));
+        const done = (t.task_status === 3 || t.task_status === 2
+          || ['claimed','done','completed','can_claim'].includes(String(t.task_status).toLowerCase()));
+        if (claimed) { out.skipped++; out.tasks.push({ title: t.title || t.subtitle || t.campaign_code, status: 'already_claimed' }); continue; }
+        if (!done) { out.skipped++; out.tasks.push({ title: t.title || t.subtitle || t.campaign_code, status: 'need_complete', task_status: t.task_status }); continue; }
+        if (!rw || rw <= 0) { out.skipped++; out.tasks.push({ title: t.title || t.subtitle || t.campaign_code, status: 'no_reward' }); continue; }
+        const campaign_code = t.campaign_code;
         const campaign_group_code = t.campaign_group_code ?? SCENE;
-        const campaign_item_code = t.campaign_item_code ?? t.item_code ?? t.code ?? t.campaign_item_code;
-        const AgwCommonParam = t.AgwCommonParam ?? t.agw_common_param ?? {};
-        if (!task_id || !campaign_item_code) {
-          out.skipped++; out.tasks.push({ title: t.title || t.name || task_id, status: 'skip_no_params', task_id, campaign_item_code });
-          continue;
-        }
-        // 尽力带上豆包可能需要的附属字段（不确定哪些必填，多带不亏，便于一次成功）
-        const body = { task_id, campaign_group_code, campaign_item_code, AgwCommonParam };
-        if (t.biz_params) body.biz_params = t.biz_params;
-        if (t.extend) body.extend = t.extend;
-        if (t.extra) body.extra = t.extra;
-        if (t.scene) body.scene = t.scene;
+        if (!campaign_code) { out.skipped++; out.tasks.push({ title: t.title || t.subtitle, status: 'skip_no_code' }); continue; }
+        // claim 用真实字段：campaign_code + campaign_group_code（真实任务对象里没有 task_id / campaign_item_code）
+        const body = { campaign_code, campaign_group_code, AgwCommonParam: {} };
         const r = await post('/alice/ug/campaign/item/reward/claim/', body);
         const ok = r && r.code === 0;
+        dlog('CLAIM ' + JSON.stringify({ title: t.title || t.subtitle || campaign_code, body, resp: r }));
         if (ok) out.claimed++; else out.failed++;
-        out.tasks.push({ title: t.title || t.name || task_id, status: ok ? 'claimed' : ('fail:' + (r && r.code)), code: r && r.code, msg: (r && (r.msg || r.message)) || '' });
+        out.tasks.push({ title: t.title || t.subtitle || campaign_code, status: ok ? 'claimed' : ('fail:' + (r && r.code)), code: r && r.code, msg: (r && (r.msg || r.message)) || '' });
       }
       return out;
     }, { SCENE, QP });
@@ -229,30 +227,39 @@ async function getTaskList() {
         tasks = (lg.data && (lg.data.tasks || lg.data.task_list || [])) || [];
       }
       const rewardOf = (t) => {
+        // 真实字段：chat_activity 奖励在 reward_summaries 数组；daily_signin 在 daily_checkin.reward.reward_amount
+        if (Array.isArray(t.reward_summaries) && t.reward_summaries.length) {
+          return t.reward_summaries.reduce((s, x) => s + (x.reward_amount || 0), 0);
+        }
+        if (t.daily_checkin && t.daily_checkin.reward && typeof t.daily_checkin.reward.reward_amount === 'number') return t.daily_checkin.reward.reward_amount;
         if (typeof t.reward_amount === 'number') return t.reward_amount;
         if (t.reward && typeof t.reward.reward_amount === 'number') return t.reward.reward_amount;
-        if (typeof t.bonus === 'number') return t.bonus;
-        if (t.reward && typeof t.reward.amount === 'number') return t.reward.amount;
         return 0;
       };
-      const claimedOf = (t) => !!(t.claimed || t.is_claimed
-        || ['claimed', 'received', 'done', 'finished', '3'].includes(String(t.status).toLowerCase()));
+      const claimedOf = (t) => !!(t.claimed || t.is_claimed || t.reward_status === 3
+        || [3, 'claimed', 'received', 'done', 'finished'].includes(t.task_status)
+        || [3, 'claimed'].includes(t.reward_status));
+      const isDone = (t) => {
+        const s = t.task_status;
+        return s === 3 || s === 2 || ['claimed','done','completed','can_claim'].includes(String(s).toLowerCase());
+      };
       const list = tasks.map((t) => {
         const isSignin = (t.campaign_code === 'daily_signin' || t.task_kind === 'daily_signin');
         const rw = rewardOf(t);
         const claimed = claimedOf(t);
-        const task_id = t.task_id ?? t.id ?? t.item_id;
-        const campaign_item_code = t.campaign_item_code ?? t.item_code ?? t.code ?? t.campaign_item_code;
+        const done = isDone(t);
+        const campaign_code = t.campaign_code;
+        const campaign_group_code = t.campaign_group_code ?? SCENE;
         return {
-          title: t.title || t.name || t.task_name || ('任务' + (task_id || '')),
-          kind: isSignin ? 'daily_signin' : (t.task_kind || t.campaign_code || ''),
-          status_raw: t.status,
+          title: t.title || t.subtitle || campaign_code,
+          kind: isSignin ? 'daily_signin' : (t.campaign_type || t.task_kind || ''),
+          status_raw: t.task_status,
           claimed: claimed,
           reward: rw,
-          claimable: (!isSignin && !claimed && rw > 0 && task_id && campaign_item_code),
-          task_id: task_id,
-          campaign_item_code: campaign_item_code,
-          campaign_group_code: t.campaign_group_code ?? SCENE,
+          claimable: (!isSignin && !claimed && done && rw > 0),
+          task_id: campaign_code,
+          campaign_code: campaign_code,
+          campaign_group_code: campaign_group_code,
         };
       });
       return { detail_code: detail.code, list, raw: tasks };

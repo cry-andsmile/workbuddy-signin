@@ -5926,12 +5926,15 @@ function renderDoubaoTasks(res){
     +   '<div class="fstat">共 '+list.length+' 个任务 · 可领 '+claimable+' 项（约 '+reward+' 额度）· 已领 '+claimed+' 项</div>'
     + '</div>'
     + '<button class="btn-mini" id="dbClaimAll" style="width:100%;padding:14px;font-size:15px;--c:#FF6A00;--c2:#FF9248">🎯 一键完成任务</button>'
-    + '<div class="fnote">点「一键完成任务」会在本机浏览器内逐个领取可领任务积分。需豆包电脑版客户端专属的任务可能无法自动领取。</div>';
+    + '<div class="fnote">点「一键完成任务」会在本机浏览器内逐个领取可领任务积分。需豆包电脑版客户端专属的任务可能无法自动领取。</div>'
+    + '<button class="btn-mini" id="dbCopyRaw" style="width:100%;padding:10px;margin-top:8px;font-size:13px;background:#fff;color:#FF6A00;border:1px solid #FF6A00">📋 复制原始任务数据（贴给 AI 校准用）</button>';
   if(list.length){
     html += '<div class="dtasks">';
     list.forEach(function(t){
       var st = t.claimed ? '<span class="st claimed">✅ 已领取</span>'
             : t.claimable ? '<span class="st todo">🎯 可领取</span>'
+            : (t.status_raw===3) ? '<span class="st claimed">✅ 已完成</span>'
+            : (t.status_raw===1) ? '<span class="st">⏳ 待完成（去豆包做）</span>'
             : '<span class="st">⏳ '+(t.status_raw||'待完成')+'</span>';
       var meta = [];
       if(t.kind) meta.push(t.kind);
@@ -5947,19 +5950,58 @@ function renderDoubaoTasks(res){
   el.innerHTML = html;
   var cb = $("dbClaimAll");
   if(cb) cb.addEventListener("click", function(){ doubaoClaimTasks(cb); });
+  var cr = $("dbCopyRaw");
+  if(cr) cr.addEventListener("click", function(){
+    var raw = (res && res.raw) ? JSON.stringify(res.raw) : "（无原始数据）";
+    if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(raw).then(function(){ showMsg("原始任务数据已复制，请贴给 AI","ok"); }, function(){ showMsg("复制失败，请手动从 doubao_sign.log 取","err"); }); }
+    else { showMsg("当前环境不支持复制，请打开 doubao_sign.log 取 TASKS_RAW","err"); }
+  });
 }
 function doubaoClaimTasks(btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>领取中…'; }
   // 优先直连本机签名服务（PC 浏览器 + localhost 豁免混合内容）；失败则走 112 中继（手机端可用）
   fetch("http://127.0.0.1:8791/tasks",{method:"POST"}).then(function(r){return r.json();}).then(function(j){
     if(j && j.ok){
-      showMsg("豆包任务积分已领取","ok");
-      loadDoubaoTasksModal();
+      renderDoubaoClaimResult(j.result);
       load();
     } else {
       relayDoubaoTasksClaim(btn);
     }
   }).catch(function(){ relayDoubaoTasksClaim(btn); });
+}
+function renderDoubaoClaimResult(result){
+  var el = $("modal-body"); if(!el) return;
+  var res = result || {};
+  var tasks = res.tasks || [];
+  var claimed = res.claimed || 0, failed = res.failed || 0, skipped = res.skipped || 0;
+  var html = ''
+    + '<div class="fhead" style="--c:#FF6A00;--c2:#FF9248">'
+    +   '<h2>🎯 领取结果</h2>'
+    +   '<div class="fstat">已领 '+claimed+' · 失败 '+failed+' · 跳过 '+skipped+'</div>'
+    + '</div>'
+    + '<button class="btn-mini" id="dbRetry" style="width:100%;padding:12px;--c:#FF6A00;--c2:#FF9248">🔄 重新领取</button>'
+    + '<div class="fnote">若部分任务失败，把下方失败 code 贴给 AI 即可校准 claim 字段。</div>'
+    + '<div class="dtasks">';
+  if(tasks.length){
+    tasks.forEach(function(t){
+      var st = (t.status==='claimed') ? '<span class="st claimed">✅ 已领</span>'
+            : (t.status==='need_complete') ? '<span class="st">⏭️ 需先去豆包完成</span>'
+            : (String(t.status||'').indexOf('fail')===0) ? '<span class="st todo">❌ '+(t.code!=null?('code '+t.code):'失败')+'</span>'
+            : '<span class="st">⏭️ '+(t.status||'跳过')+'</span>';
+      var meta = [];
+      if(t.code!=null) meta.push('code='+t.code);
+      if(t.msg) meta.push(t.msg);
+      html += '<div class="task"><div class="tt"><div class="t1">'+esc(t.title||'')+'</div>'
+        + (meta.length?('<div class="t2">'+esc(meta.join(' · '))+'</div>'):'')
+        + '</div><div class="tr">'+st+'</div></div>';
+    });
+  } else {
+    html += '<div class="dempty">无任务明细</div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+  var rb = $("dbRetry");
+  if(rb) rb.addEventListener("click", function(){ loadDoubaoTasksModal(); });
 }
 function relayDoubaoTasksClaim(btn){
   // 手机端/服务未起：经 112 中继写标志，待本机服务轮询领取
