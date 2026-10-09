@@ -5790,24 +5790,32 @@ function markCardErr(name,msg){
   d.textContent = '⚠️ ' + msg;
   cm.appendChild(d);
 }
+function relayDoubao(btn){
+  // 经 112 中继：网页(Https)写 pending 标志，本机签名服务轮询领取并执行真实浏览器签名。
+  api("api/doubao/request-sign",{method:"POST"}).then(function(d){
+    if(d && d.ok){
+      showMsg("已通知本机豆包签名服务，正在签到，稍候自动刷新…","ok");
+      setTimeout(function(){ load(); }, 18000);
+    } else {
+      load(function(){ showMsg("本机签名服务未运行，请先运行 doubao_signer.bat，或去豆包电脑版客户端签到","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
+    }
+  }).catch(function(){
+    load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端签到","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
+  });
+}
 function doCheckin(name,btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>签到中…'; }
   // 豆包：签到写接口需浏览器实时算 a_bogus，服务端无法代签 —— 改调本机签名服务（同机常驻）。
   if(name==="doubao"){
+    // 优先直连本机签名服务（PC 浏览器 + localhost 豁免混合内容）；失败则走 112 中继（轮询），
+    // 中继可跨设备（手机端也能触发），且规避 HTTPS→HTTP 混合内容拦截。
     fetch("http://127.0.0.1:8791/doubao/sign",{method:"POST"}).then(function(r){return r.json();}).then(function(j){
       if(j && j.ok){
         load(function(){ showMsg("豆包已通过本机签名服务签到 ✅", "ok"); });
       } else {
-        var em = (j&&j.error) ? j.error : "本机签名服务无响应";
-        // 本机服务不可达：回退服务端（只读状态）
-        api("api/center/checkin?name=doubao",{method:"POST"}).then(function(d){
-          load(function(){ showMsg("本机签名失败："+em+"（请确认 doubao_signer.bat 已运行）","err"); markCardErr(name,em); });
-        }).catch(function(){ load(function(){ showMsg("本机签名失败："+em,"err"); markCardErr(name,em); }); });
+        relayDoubao(btn);
       }
-    }).catch(function(){
-      // 跨域/服务未启动：回退服务端只读 + 提示
-      load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端签到","err"); markCardErr(name,"本机签名服务未运行"); });
-    });
+    }).catch(function(){ relayDoubao(btn); });
     return;
   }
   api("api/center/checkin?name="+encodeURIComponent(name),{method:"POST"}).then(function(d){
@@ -5883,6 +5891,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send(
             code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8"
         )
+
+    def _doubao_poll_response(self):
+        # 本机签名服务轮询：返回是否有待处理签到请求，并消费(清空)标志。
+        # GET/POST 共用，避免两份逻辑漂移。
+        _p = os.path.join(BASE_DIR, "doubao_sign_request.json")
+        _pending = False
+        if os.path.exists(_p):
+            try:
+                _d = json.load(open(_p, encoding="utf-8"))
+                _pending = bool(_d.get("pending"))
+            except Exception:
+                _pending = False
+            try:
+                os.remove(_p)
+            except Exception:
+                pass
+        self._json(200, {"ok": True, "pending": _pending})
 
     def _key_ok(self, query):
         if not current_key():
@@ -6007,6 +6032,17 @@ class Handler(BaseHTTPRequestHandler):
                 "has_webhook": bool(SETTINGS.get("notify_webhook", "")),
             })
             return
+        if u.path == "/api/doubao/poll":
+            # 本机签名服务轮询(GET)：返回是否有待处理签到请求，并消费(清空)标志。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "need key", "needKey": True})
+                return
+            try:
+                self._doubao_poll_response()
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
         self._send(404, "not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -6077,6 +6113,32 @@ class Handler(BaseHTTPRequestHandler):
                 t = threading.Thread(target=run_growth_background, daemon=True)
                 t.start()
                 self._json(200, {"ok": True, "started": True, "running": True})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/doubao/request-sign":
+            # 网页(Https)无法直接 fetch 本机 http 签名服务(混合内容拦截)，故经 112 中继：
+            # 网页写入 pending 标志，本机签名服务轮询领取并执行真实签到。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "需要访问口令", "needKey": True})
+                return
+            try:
+                import time as _t
+                with open(os.path.join(BASE_DIR, "doubao_sign_request.json"), "w", encoding="utf-8") as _f:
+                    json.dump({"pending": True, "ts": int(_t.time())}, _f)
+                self._json(200, {"ok": True})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/doubao/poll":
+            # 本机签名服务轮询(POST 也保留兼容)：复用 GET 同一逻辑。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "need key", "needKey": True})
+                return
+            try:
+                self._doubao_poll_response()
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return

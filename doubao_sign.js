@@ -154,6 +154,24 @@ function scheduleDaily() {
 }
 scheduleDaily();
 
+// ---- 中继通道：轮询 112 上的待处理签到请求（解决 HTTPS 页无法直接 fetch 本机 http 服务）----
+const RELAY_URL = 'https://bjzjsf.asia/checkin/api/doubao/poll';
+const RELAY_KEY = '19921010';
+function startRelay() {
+  setInterval(async () => {
+    try {
+      const r = await fetch(RELAY_URL + '?k=' + encodeURIComponent(RELAY_KEY), { method: 'GET' });
+      const j = await r.json();
+      if (j && j.ok && j.pending) {
+        console.log('[doubao-sign] relay: 收到网页签到请求，执行本机浏览器签名...');
+        const res = await doSign();
+        console.log('[doubao-sign] relay sign result:', JSON.stringify(res).slice(0, 200));
+      }
+    } catch (e) { /* 网络抖动忽略 */ }
+  }, 15000);
+}
+startRelay();
+
 process.on('SIGINT', async () => {
   console.log('[doubao-sign] 正在关闭 ...');
   if (_browserPromise) { try { (await _browserPromise).close(); } catch (e) {} }

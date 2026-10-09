@@ -103,6 +103,8 @@ _t_*.out
 _verify_*
 # 豆包签名服务运行日志（运行态）
 doubao_sign.log
+# 豆包签到中继标志（运行态，本机服务轮询领取）
+doubao_sign_request.json
 
 # Trae 限流重试持久化状态（运行态，重启后由服务自动恢复）
 trae_retry_state.json
