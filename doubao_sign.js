@@ -101,6 +101,86 @@ async function doSign() {
   }
 }
 
+// 一键完成任务 + 领积分：在页面内拉任务列表，对可领任务逐个 item/reward/claim。
+// 写接口需要 a_bogus，必须走真实浏览器（fetch 包装层自动加签）。
+async function doTasks() {
+  if (_signing) return { ok: false, error: '已有签到任务进行中' };
+  _signing = true;
+  let ctx;
+  try {
+    ctx = await getBrowser();
+    const page = await ctx.newPage();
+    const cookie = loadCookieHeader();
+    if (cookie) {
+      const sid = (cookie.match(/sessionid=([^;]+)/) || [])[1];
+      if (sid) {
+        await ctx.addCookies([
+          { name: 'sessionid', value: sid, domain: '.doubao.com', path: '/' },
+          { name: 'sessionid_ss', value: sid, domain: '.doubao.com', path: '/' },
+        ]).catch(() => {});
+      }
+    }
+    await page.goto('https://www.doubao.com/pc/agent-explore', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    for (let i = 0; i < 40; i++) {
+      if (await page.evaluate(() => typeof window.byted_acrawler !== 'undefined').catch(() => false)) break;
+      await page.waitForTimeout(1000);
+    }
+    await page.waitForTimeout(2500);
+
+    const result = await page.evaluate(async (arg) => {
+      const { SCENE, QP } = arg;
+      const base = 'https://www.doubao.com';
+      const headers = { 'Content-Type': 'application/json', 'Referer': base + '/pc/agent-explore', 'Origin': base };
+      const post = async (p, body) => {
+        const r = await fetch(base + p + '?' + QP, { method: 'POST', headers, body: JSON.stringify(body) });
+        const t = await r.text();
+        try { return JSON.parse(t); } catch (e) { return { __raw: t.slice(0, 300) }; }
+      };
+      // 1) 拉任务列表（优先 v3/detail，空则回退 landing/get）
+      let detail = await post('/alice/ug/campaign/v3/detail/', { campaign_group_code: SCENE });
+      let tasks = (detail.data && detail.data.tasks) || [];
+      if (!tasks.length) {
+        const lg = await post('/alice/ug/campaign/landing/get', { scene: SCENE });
+        tasks = (lg.data && (lg.data.tasks || lg.data.task_list || [])) || [];
+      }
+      const out = { detail_code: detail.code, task_count: tasks.length, tasks: [], claimed: 0, failed: 0, skipped: 0 };
+      for (const t of tasks) {
+        // 跳过「每日签到」（由 /sign 处理）
+        const isSignin = (t.campaign_code === 'daily_signin' || t.task_kind === 'daily_signin');
+        if (isSignin) continue;
+        const rw = (typeof t.reward_amount === 'number') ? t.reward_amount
+                 : (t.reward && typeof t.reward.reward_amount === 'number') ? t.reward.reward_amount
+                 : (typeof t.bonus === 'number') ? t.bonus
+                 : (t.reward && typeof t.reward.amount === 'number') ? t.reward.amount : 0;
+        const claimed = !!(t.claimed || t.is_claimed
+          || ['claimed', 'received', 'done', 'finished', '3'].includes(String(t.status).toLowerCase()));
+        if (claimed) { out.skipped++; out.tasks.push({ title: t.title || t.name || t.task_id || t.id, status: 'already_claimed' }); continue; }
+        if (!rw || rw <= 0) { out.skipped++; out.tasks.push({ title: t.title || t.name || t.task_id || t.id, status: 'no_reward' }); continue; }
+        const task_id = t.task_id ?? t.id ?? t.item_id;
+        const campaign_group_code = t.campaign_group_code ?? SCENE;
+        const campaign_item_code = t.campaign_item_code ?? t.item_code ?? t.code ?? t.campaign_item_code;
+        const AgwCommonParam = t.AgwCommonParam ?? t.agw_common_param ?? {};
+        if (!task_id || !campaign_item_code) {
+          out.skipped++; out.tasks.push({ title: t.title || t.name || task_id, status: 'skip_no_params', task_id, campaign_item_code });
+          continue;
+        }
+        const r = await post('/alice/ug/campaign/item/reward/claim/', { task_id, campaign_group_code, campaign_item_code, AgwCommonParam });
+        const ok = r && r.code === 0;
+        if (ok) out.claimed++; else out.failed++;
+        out.tasks.push({ title: t.title || t.name || task_id, status: ok ? 'claimed' : ('fail:' + (r && r.code)), code: r && r.code, msg: (r && (r.msg || r.message)) || '' });
+      }
+      return out;
+    }, { SCENE, QP });
+
+    await page.close();
+    return { ok: true, result };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  } finally {
+    _signing = false;
+  }
+}
+
 // ---- HTTP 服务 ----
 const server = http.createServer(async (req, res) => {
   // CORS：本机签名服务只允许从本机访问，但签到中心网页(https://bjzjsf.asia)从浏览器跨域调用，
@@ -124,6 +204,12 @@ const server = http.createServer(async (req, res) => {
   }
   if (url === '/sign' && req.method === 'POST') {
     const r = await doSign();
+    res.writeHead(r.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r));
+    return;
+  }
+  if (url === '/tasks' && req.method === 'POST') {
+    const r = await doTasks();
     res.writeHead(r.ok ? 200 : 500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(r));
     return;
@@ -154,18 +240,30 @@ function scheduleDaily() {
 }
 scheduleDaily();
 
-// ---- 中继通道：轮询 112 上的待处理签到请求（解决 HTTPS 页无法直接 fetch 本机 http 服务）----
-const RELAY_URL = 'https://bjzjsf.asia/checkin/api/doubao/poll';
+// ---- 中继通道：轮询 112 上的待处理请求（解决 HTTPS 页无法直接 fetch 本机 http 服务）----
 const RELAY_KEY = '19921010';
 function startRelay() {
+  // 签到请求轮询
   setInterval(async () => {
     try {
-      const r = await fetch(RELAY_URL + '?k=' + encodeURIComponent(RELAY_KEY), { method: 'GET' });
+      const r = await fetch('https://bjzjsf.asia/checkin/api/doubao/poll?k=' + encodeURIComponent(RELAY_KEY), { method: 'GET' });
       const j = await r.json();
       if (j && j.ok && j.pending) {
         console.log('[doubao-sign] relay: 收到网页签到请求，执行本机浏览器签名...');
         const res = await doSign();
         console.log('[doubao-sign] relay sign result:', JSON.stringify(res).slice(0, 200));
+      }
+    } catch (e) { /* 网络抖动忽略 */ }
+  }, 15000);
+  // 完成任务请求轮询
+  setInterval(async () => {
+    try {
+      const r = await fetch('https://bjzjsf.asia/checkin/api/doubao/poll-tasks?k=' + encodeURIComponent(RELAY_KEY), { method: 'GET' });
+      const j = await r.json();
+      if (j && j.ok && j.pending) {
+        console.log('[doubao-sign] relay: 收到网页「完成任务」请求，执行本机浏览器领取...');
+        const res = await doTasks();
+        console.log('[doubao-sign] relay tasks result:', JSON.stringify(res).slice(0, 300));
       }
     } catch (e) { /* 网络抖动忽略 */ }
   }, 15000);

@@ -3694,6 +3694,46 @@ def _db_read_last():
         return None
 
 
+def _db_task_reward(t):
+    """从任务对象里尽量挖出可领积分（豆包字段名不稳定，多路径兜底）。仅供卡片展示用，
+    真实领取由本机签名服务在浏览器内完成。"""
+    try:
+        for k in ("reward_amount", "reward", "bonus", "credit", "points"):
+            v = t.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return v
+            if isinstance(v, dict):
+                for kk in ("reward_amount", "amount", "credit", "points", "value"):
+                    vv = v.get(kk)
+                    if isinstance(vv, (int, float)) and vv > 0:
+                        return vv
+        rw = t.get("reward") or {}
+        if isinstance(rw, dict):
+            for kk in ("reward_amount", "amount", "credit"):
+                vv = rw.get(kk)
+                if isinstance(vv, (int, float)) and vv > 0:
+                    return vv
+    except Exception:
+        pass
+    return 0
+
+
+def _db_task_claimed(t):
+    """判断是否已领取（字段名不稳定，多路径兜底）。"""
+    try:
+        if t.get("claimed") or t.get("is_claimed"):
+            return True
+        st = str(t.get("status", "")).lower()
+        if st in ("claimed", "received", "already_claimed", "3", "done", "finished"):
+            return True
+        rw = t.get("reward") or {}
+        if isinstance(rw, dict) and (rw.get("claimed") or str(rw.get("status", "")).lower() in ("claimed", "3")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def get_doubao_card():
     if not _db_cookie():
         return {
@@ -3733,6 +3773,25 @@ def get_doubao_card():
     checked = bool(dc.get("checked_in_today"))
     cont_days = dc.get("continuous_days")
     reward = (dc.get("reward") or {}).get("reward_amount")
+    # 任务奖励汇总（排除「每日签到」，由「一键完成任务」领取）：可领/已领/积分
+    _tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)
+              and not (t.get("campaign_code") == "daily_signin" or t.get("task_kind") == "daily_signin")]
+    _claimable = _claimed = _reward = 0
+    for t in _tasks:
+        if _db_task_claimed(t):
+            _claimed += 1
+        else:
+            _amt = _db_task_reward(t)
+            if _amt and _amt > 0:
+                _claimable += 1
+                _reward += _amt
+    tasks_entry = {
+        "ok": True,
+        "total": len(_tasks),
+        "claimable": _claimable,
+        "claimed": _claimed,
+        "reward": _reward,
+    }
     rows = [
         {"k": "今日签到", "v": "✅ 今日已签" if checked else "⏳ 待签到（豆包限定 PC 客户端）"},
         {"k": "会话状态", "v": "✅ 登录有效"},
@@ -3744,12 +3803,18 @@ def get_doubao_card():
     if reward is not None:
         # 未签到时该数值属于「上一次签到」，如实标注，避免被误读成今天已签
         rows.append({"k": "本次获得" if checked else "上次获得", "v": "%s 额度" % reward})
+    if _tasks:
+        if _claimable > 0:
+            rows.append({"k": "待领任务", "v": "🎯 可领 %s 项（约 %s 额度）" % (_claimable, _reward)})
+        else:
+            rows.append({"k": "任务奖励", "v": "✅ 今日任务已全部领取（%s/%s）" % (_claimed, _tasks and len(_tasks))})
     if lr:
         rows.append({"k": "上次执行", "v": "%s %s" % (str(lr.get("ts"))[5:16], "✅" if lr.get("ok") else "⚠️")})
     return {
         "name": "doubao", "title": "豆包 每日签到", "brand": "#FF6A00", "brand2": "#FF9248",
         "icon": "doubao", "checked": checked,
         "metric_label": "今日签到", "metric_value": "已签到" if checked else "待签到",
+        "tasks_entry": tasks_entry,
         "last_run": lr, "rows": rows, "error": None,
     }
 
@@ -3794,6 +3859,8 @@ def run_doubao_checkin():
 ADAPTERS = {
     "workbuddy": get_wb_card,
     "qianfan": get_qf_card,
+    # 豆包：用户指定排第 3 张卡（虽依赖本机签名服务，按用户要求前置）
+    "doubao": get_doubao_card,
     "minimax": get_mm_card,
     "qoder": get_qd_card,
     "linkai": get_lk_card,
@@ -3803,14 +3870,13 @@ ADAPTERS = {
     "huawei": get_hw_card,
     "coze": get_coze_card,
     "jimeng": get_jimeng_card,
-    "doubao": get_doubao_card,
     "oiioii": get_oiioii_card,
 }
 
 # 卡片分组标签（与上面顺序一致）：auto = 全自动；其余 = 需偶尔维护凭据
 # 注：qoder 不在 AUTO_PLATFORMS——领取由本机守护 qoder_keeper 完成（需设备指纹，服务端无法
 # 代领，详见 run_qd_checkin 注释），服务端卡片只展示守护推送的 qoder_local_status.json。
-AUTO_PLATFORMS = ("workbuddy", "qianfan", "minimax", "qoder", "lingxi", "trae", "coze", "jimeng", "doubao")
+AUTO_PLATFORMS = ("workbuddy", "qianfan", "doubao", "minimax", "qoder", "lingxi", "trae", "coze", "jimeng")
 # 「派猫猫旅行」不再单独成卡，它作为 WorkBuddy 卡内的入口（弹窗），但仍是全自动项目：
 # 每天派出 + 到点自动领奖，所以「立即全部签到」/每日自动要把 travel 一起带上。
 AUTO_RUN = AUTO_PLATFORMS + ("travel",)
@@ -4871,8 +4937,8 @@ function cardHTML(it){
 }
 // WorkBuddy 卡片内的入口：成长中心 / 每日任务（新标签页）+ 派猫猫旅行（弹窗）
 function entriesHTML(it){
-  var ge = it.growth_entry, de = it.daily_entry, te = it.travel_entry, qe = it.qfdaily_entry;
-  if(!ge && !de && !te && !qe) return '';
+  var ge = it.growth_entry, de = it.daily_entry, te = it.travel_entry, qe = it.qfdaily_entry, dte = it.tasks_entry;
+  if(!ge && !de && !te && !qe && !dte) return '';
   var e = '';
   if(ge){
     var g = ge.ok
@@ -4892,6 +4958,16 @@ function entriesHTML(it){
     var qf = (qe.todo==null) ? '查看任务' : (qe.todo>0 ? (qe.todo+' 项待完成') : '今日已全部完成');
     e += '<button class="entry" type="button" id="qfDailyEntry" data-qfdaily="1">'
        + '<span class="eic">🧭</span><span class="etx"><b>活动中心</b><small>'+esc(qf)+'</small></span><span class="earrow">›</span></button>';
+  }
+  if(dte){
+    var dt;
+    if(!dte.ok) dt = '暂不可用';
+    else if(dte.claimable>0) dt = '🎯 可领 '+dte.claimable+' 项（约 '+dte.reward+' 额度）';
+    else if(dte.total>0 && dte.claimed>=dte.total) dt = '✅ 今日任务已全部领取';
+    else if(dte.total===0) dt = '暂无任务';
+    else dt = (dte.claimed||0)+'/'+(dte.total||0)+' 已领取';
+    e += '<button class="entry" type="button" id="doubaoTasksEntry" data-dbtasks="1">'
+       + '<span class="eic">🎯</span><span class="etx"><b>完成任务</b><small>'+esc(dt)+'</small></span><span class="earrow">›</span></button>';
   }
   var html = e ? ('<div class="entries">'+e+'</div>') : '';
   // 派猫猫旅行：同样属于 WorkBuddy，但改成弹窗（数据量大、含明信片与操作按钮），独占一行
@@ -5717,6 +5793,10 @@ function renderCenter(d){
   Array.prototype.forEach.call(document.querySelectorAll('button.entry[data-qfdaily]'), function(b){
     b.addEventListener('click', function(ev){ if(ev && ev.stopPropagation) ev.stopPropagation(); openQfDaily(); });
   });
+  // 豆包卡内「完成任务」入口 → 一键领取任务积分（与签到同构，走本机签名服务/中继，不打弹窗）
+  Array.prototype.forEach.call(document.querySelectorAll('button.entry[data-dbtasks]'), function(b){
+    b.addEventListener('click', function(ev){ if(ev && ev.stopPropagation) ev.stopPropagation(); doDoubaoTasks(b); });
+  });
   // 重新检查签到状态（只刷新、不执行签到）
   Array.prototype.forEach.call(document.querySelectorAll("button.cta.recheck[data-name]"), function(b){
     b.addEventListener("click", function(){ recheck(b.getAttribute("data-name"), b); });
@@ -5802,6 +5882,31 @@ function relayDoubao(btn){
   }).catch(function(){
     load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端签到","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
   });
+}
+function relayDoubaoTasks(btn){
+  // 经 112 中继：网页(Https)写 pending 标志，本机签名服务轮询领取并执行「完成任务 + 领积分」。
+  api("api/doubao/request-tasks",{method:"POST"}).then(function(d){
+    if(d && d.ok){
+      showMsg("已通知本机豆包签名服务，正在领取任务积分，稍候自动刷新…","ok");
+      setTimeout(function(){ load(); }, 20000);
+    } else {
+      load(function(){ showMsg("本机签名服务未运行，请先运行 doubao_signer.bat，或去豆包电脑版客户端完成任务","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
+    }
+  }).catch(function(){
+    load(function(){ showMsg("未检测到本机豆包签名服务，请先运行 doubao_signer.bat，或去豆包电脑版客户端完成任务","err"); if(btn){btn.disabled=false;btn.textContent="重试";} markCardErr("doubao","本机签名服务未运行"); });
+  });
+}
+function doDoubaoTasks(btn){
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>领取中…'; }
+  // 豆包任务写接口需浏览器实时算 a_bogus，服务端无法代签 —— 与签到同构，改调本机签名服务。
+  // 优先直连本机签名服务（PC 浏览器 + localhost 豁免混合内容）；失败则走 112 中继（轮询，手机端也可用）。
+  fetch("http://127.0.0.1:8791/doubao/tasks",{method:"POST"}).then(function(r){return r.json();}).then(function(j){
+    if(j && j.ok){
+      load(function(){ showMsg("豆包任务积分已通过本机签名服务领取 ✅", "ok"); });
+    } else {
+      relayDoubaoTasks(btn);
+    }
+  }).catch(function(){ relayDoubaoTasks(btn); });
 }
 function doCheckin(name,btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="spin"></span>签到中…'; }
@@ -5892,10 +5997,11 @@ class Handler(BaseHTTPRequestHandler):
             code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8"
         )
 
-    def _doubao_poll_response(self):
-        # 本机签名服务轮询：返回是否有待处理签到请求，并消费(清空)标志。
+    def _doubao_poll_response(self, fname="doubao_sign_request.json"):
+        # 本机签名服务轮询：返回是否有待处理请求，并消费(清空)标志。
+        # fname 区分签到(doubao_sign_request.json)与完成任务(doubao_sign_request_tasks.json)。
         # GET/POST 共用，避免两份逻辑漂移。
-        _p = os.path.join(BASE_DIR, "doubao_sign_request.json")
+        _p = os.path.join(BASE_DIR, fname)
         _pending = False
         if os.path.exists(_p):
             try:
@@ -6043,6 +6149,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
+        if u.path == "/api/doubao/poll-tasks":
+            # 本机签名服务轮询(GET)：返回是否有待处理「完成任务」请求，并消费(清空)标志。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "need key", "needKey": True})
+                return
+            try:
+                self._doubao_poll_response("doubao_sign_request_tasks.json")
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
         self._send(404, "not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -6139,6 +6256,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._doubao_poll_response()
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/doubao/request-tasks":
+            # 网页(Https)经 112 中继通知本机签名服务：执行「一键完成任务 + 领积分」。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "需要访问口令", "needKey": True})
+                return
+            try:
+                import time as _t
+                with open(os.path.join(BASE_DIR, "doubao_sign_request_tasks.json"), "w", encoding="utf-8") as _f:
+                    json.dump({"pending": True, "ts": int(_t.time())}, _f)
+                self._json(200, {"ok": True})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/doubao/poll-tasks":
+            # 本机签名服务轮询(POST 也保留兼容)：复用 GET 同一逻辑（完成任务标志）。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "need key", "needKey": True})
+                return
+            try:
+                self._doubao_poll_response("doubao_sign_request_tasks.json")
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
