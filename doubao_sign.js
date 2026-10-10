@@ -54,6 +54,25 @@ async function getBrowser() {
   return _browserPromise;
 }
 
+// 方案二支持：把当前浏览器里的豆包登录态(cookie)推送到 112，供服务器签名器代签。
+// 上传失败不影响本机签到（可忽略，下次重试）。
+async function uploadCookiesToServer() {
+  try {
+    const ctx = await getBrowser();
+    const cookies = await ctx.cookies();
+    if (!cookies || !cookies.length) return;
+    const r = await fetch('https://bjzjsf.asia/checkin/api/doubao/upload-cookie?k=' + encodeURIComponent(RELAY_KEY), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cookies),
+    });
+    const j = await r.json().catch(() => ({}));
+    dlog('[cookie-sync] 已推送 ' + cookies.length + ' 条 cookie -> ' + JSON.stringify(j).slice(0, 120));
+  } catch (e) {
+    dlog('[cookie-sync] 推送失败(可忽略): ' + e);
+  }
+}
+
 async function doSign() {
   if (_signing) return { ok: false, error: '已有签到任务进行中' };
   _signing = true;
@@ -95,6 +114,7 @@ async function doSign() {
     }, { SCENE, QP });
 
     await page.close();
+    uploadCookiesToServer();
     return { ok: true, result };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -177,6 +197,7 @@ async function doTasks() {
     }, { SCENE, QP });
 
     await page.close();
+    uploadCookiesToServer();
     return { ok: true, result };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -266,6 +287,7 @@ async function getTaskList() {
     }, { SCENE, QP });
 
     await page.close();
+    uploadCookiesToServer();
     return { ok: true, result };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -285,6 +307,17 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = req.url.split('?')[0];
+  if (url === '/sync-cookie') {
+    // 方案二：手动触发一次把本机 cookie 推送到 112（浏览器访问 http://127.0.0.1:8791/sync-cookie 即可）
+    uploadCookiesToServer().then(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, msg: 'cookie 推送已触发，详见 doubao_sign.log' }));
+    }).catch((e) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: String(e) }));
+    });
+    return;
+  }
   if (url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, service: 'doubao-sign', ts: Date.now() }));
@@ -401,6 +434,10 @@ async function ensureSignedToday() {
 // 启动后 15s 补签一次（覆盖「刚启动服务、今天还没签」场景）；之后每 20 分钟保活
 setTimeout(() => ensureSignedToday(), 15000);
 setInterval(() => ensureSignedToday(), 20 * 60 * 1000);
+
+// 方案二：每 30 分钟把本机 cookie 推送到 112（若浏览器已预热），保证服务器侧登录态常新。
+// 王少电脑开机期间会自动续 cookie；关机后服务器用最后一次同步的 cookie 继续代签。
+setInterval(() => uploadCookiesToServer(), 30 * 60 * 1000);
 
 process.on('SIGINT', async () => {
   console.log('[doubao-sign] 正在关闭 ...');

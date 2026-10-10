@@ -1,0 +1,20 @@
+[Unit]
+Description=Doubao server-side a_bogus signer (headless chromium on 112)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wb-checkin
+ExecStart=/usr/bin/node /opt/wb-checkin/doubao_sign_server.js
+Restart=always
+RestartSec=5
+User=root
+# Playwright 装在项目本地 node_modules
+Environment=NODE_PATH=/opt/wb-checkin/node_modules
+# 服务器签名器读取本机同步过来的 cookie
+Environment=DOUBAO_SERVER_COOKIE_FILE=/opt/wb-checkin/doubao_cookies_server.json
+Environment=DOUBAO_SERVER_USERDATA=/opt/wb-checkin/doubao_server_profile
+
+[Install]
+WantedBy=multi-user.target

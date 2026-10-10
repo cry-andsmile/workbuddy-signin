@@ -6272,6 +6272,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
+        if u.path == "/api/doubao/cookie-status":
+            # 方案二：返回服务器侧是否已收到本机同步来的豆包 cookie。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "need key", "needKey": True})
+                return
+            try:
+                p = os.path.join(BASE_DIR, "doubao_cookies_server.json")
+                if os.path.exists(p):
+                    self._json(200, {"ok": True, "exists": True, "mtime": os.stat(p).st_mtime})
+                else:
+                    self._json(200, {"ok": True, "exists": False})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
         self._send(404, "not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -6393,6 +6408,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 self._doubao_poll_response("doubao_sign_request_tasks.json")
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/doubao/upload-cookie":
+            # 方案二：本机签名服务把豆包登录态(cookie 数组)推送到 112，服务器签名器据此代签。
+            # 鉴权复用签到中心访问口令（与中继同一把 key）。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "need key", "needKey": True})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b"[]"
+                arr = json.loads(raw.decode("utf-8", "replace"))
+                if not isinstance(arr, list) or not arr:
+                    self._json(200, {"ok": False, "error": "body 应为非空 cookie 数组"})
+                    return
+                with open(os.path.join(BASE_DIR, "doubao_cookies_server.json"), "w", encoding="utf-8") as _f:
+                    json.dump(arr, _f, ensure_ascii=False)
+                # 顺手导出 sessionid 供卡片状态读取(DOUBAO_COOKIE 路径)
+                sid = None
+                for c in arr:
+                    if isinstance(c, dict) and c.get("name") == "sessionid" and c.get("value"):
+                        sid = c["value"]; break
+                if sid:
+                    with open(os.path.join(BASE_DIR, "doubao_cookie.txt"), "w", encoding="utf-8") as _f:
+                        _f.write(sid)
+                dlog("doubao cookie 已同步到服务器，共 %d 条" % len(arr))
+                self._json(200, {"ok": True, "cookie_count": len(arr), "has_sessionid": bool(sid)})
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
