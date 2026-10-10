@@ -107,6 +107,8 @@ doubao_sign.log
 doubao_sign_request.json
 # 豆包「完成任务」中继标志（运行态）
 doubao_sign_request_tasks.json
+# 豆包「今日已签」防漏签状态（运行态）
+doubao_signed_today.json
 
 # Trae 限流重试持久化状态（运行态，重启后由服务自动恢复）
 trae_retry_state.json

@@ -378,6 +378,30 @@ function startRelay() {
 }
 startRelay();
 
+// ---- 防漏签：启动补签 + 每 20 分钟保活（覆盖电脑睡眠错过 08:25 定时 / 进程重启遗漏）----
+const SIGN_STATE = path.join(__dirname, 'doubao_signed_today.json');
+function signedTodayFlag() {
+  try {
+    const d = JSON.parse(fs.readFileSync(SIGN_STATE, 'utf-8'));
+    return d.date === new Date().toISOString().slice(0, 10);
+  } catch (e) { return false; }
+}
+function markSignedToday() {
+  try { fs.writeFileSync(SIGN_STATE, JSON.stringify({ date: new Date().toISOString().slice(0, 10), ts: Date.now() })); } catch (e) {}
+}
+async function ensureSignedToday() {
+  if (signedTodayFlag()) { dlog('[doubao-sign] 今日已签到，保活跳过'); return; }
+  dlog('[doubao-sign] 保活补签：今日尚未签到，尝试...');
+  try {
+    const r = await doSign();
+    if (r && r.ok) markSignedToday();
+    dlog('[doubao-sign] 保活补签结果: ' + JSON.stringify(r && r.result ? r.result : r).slice(0, 200));
+  } catch (e) { dlog('[doubao-sign] 保活补签出错: ' + e); }
+}
+// 启动后 15s 补签一次（覆盖「刚启动服务、今天还没签」场景）；之后每 20 分钟保活
+setTimeout(() => ensureSignedToday(), 15000);
+setInterval(() => ensureSignedToday(), 20 * 60 * 1000);
+
 process.on('SIGINT', async () => {
   console.log('[doubao-sign] 正在关闭 ...');
   if (_browserPromise) { try { (await _browserPromise).close(); } catch (e) {} }
