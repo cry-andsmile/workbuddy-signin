@@ -11,6 +11,12 @@ if %errorLevel% neq 0 (
 cd /d "%~dp0"
 echo Registering scheduled task DoubaoSignService ...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_doubao_task.ps1"
+if errorlevel 1 (
+    echo.
+    echo [X] Setup failed. Task NOT created. See errors above.
+    pause
+    exit /b 1
+)
 echo.
 echo Starting service now ...
 schtasks /run /tn DoubaoSignService
