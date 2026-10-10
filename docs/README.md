@@ -8,7 +8,7 @@
 
 ## 它能签到哪些平台
 
-卡片顺序 = `web_server.py` 中 `ADAPTERS` 字典的插入顺序。**共 11 张卡**：多数可全自动（WorkBuddy / 千帆 / MiniMax / 即梦 / 灵犀 / Trae / Coze）；Link AI、OiiOii 因接口强制人机验证（Link AI 图片验证码 / OiiOii 腾讯云验证码），服务端无法代签，需网页手动签到后卡片「✅ 我已在网页签到」确认；Qoder 卡片仍展示，但每日 100 Credits 因官方限制需**桌面端手动领**（不在服务端自动签到列表）；华为为手动卡，支持**网页粘贴会话 Cookie 直接登录**。
+卡片顺序 = `web_server.py` 中 `ADAPTERS` 字典的插入顺序。**共 12 张卡**：多数可全自动（WorkBuddy / 千帆 / MiniMax / 即梦 / 灵犀 / Trae / Coze）；Link AI、OiiOii 因接口强制人机验证（Link AI 图片验证码 / OiiOii 腾讯云验证码），服务端无法代签，需网页手动签到后卡片「✅ 我已在网页签到」确认；Qoder 卡片仍展示，但每日 100 Credits 因官方限制需**桌面端手动领**（不在服务端自动签到列表）；华为为手动卡，支持**网页粘贴会话 Cookie 直接登录**；**豆包为「浏览器签名代理」架构**——详见下方「第 9 步 · 豆包」。
 
 > 所有卡片底部统一显示「可用积分」（5 家真实有余额：即梦 / 千帆 / WorkBuddy / Link AI / OiiOii；其余接口不提供余额则诚实显示「—」）；即梦额外显示「88 积分将于 x月x日 过期」提示。
 
@@ -25,12 +25,25 @@
 | 即梦 AI | jimeng.jianying.com | 每日登录发放免费额度（实测 88 赠送积分） | `jimeng_cookie.txt` | 字节风控强，Cookie 周期失效需重捕 |
 | OiiOii AI | oiioii.ai | 每日签到积分（可用余额实时查询） | `oiioii_token.txt`（Supabase 登录 JWT，约 7 天有效） | 接口强制腾讯云人机验证，服务端无法代签；网页手动签到后卡片确认 |
 | 华为码道（手动卡） | devcloud.cn-north-4.huaweicloud.com | — | `hw_cookie.txt`（本机 `hw_autopush.py` 自动同步；亦支持网页「🔑 配置会话 Cookie」粘贴登录） | 会话失效后双击 `huawei/relogin_huawei.bat` |
+| **豆包 Doubao** | doubao.com / 豆包 PC 客户端 | 每日签到 + 积分任务领奖 | 浏览器实时算签代持（详见下方「第 9 步 · 豆包」） | 随会话（约 30 天，靠本机续传） |
 
 > **派猫猫旅行**已并入 WorkBuddy：它共用 WorkBuddy 登录态，在 WorkBuddy 卡内作为弹窗入口，不单独成卡、也不在设置页单独配置（开关跟随 WorkBuddy）。
 >
 > **CodeBuddy / MiniMax Agent** 曾经加过，但实测与 WorkBuddy / MiniMax Code 是同一套登录态、同一笔积分，属重复项，已删除。
 >
 > 卡片为响应式 CSS Grid：`<600px 单列 / ≥600px 两列 / ≥920px 三列 / ≥1240px 四列`；详情是**真模态弹窗**（× / 点遮罩 / Esc 三种关闭），每卡右下角「🌐 前往官网登录」跳官方站点。
+
+### 🟣 豆包 Doubao（第 12 张卡 · 浏览器签名代理架构）
+
+豆包是这 12 家里**唯一不能纯靠静态 token/cookie 在服务端直接签**的平台，因为它在签到/领积分的写接口上强制一道 **`a_bogus` 动态签名**：这串签名由豆包网页 JS 在你**真浏览器发请求的那一刻**临时算出来（把请求参数 + 时间戳 + 浏览器指纹搅一起哈希），算签函数锁死在网页闭包里，服务器根本拿不到。服务器光持你的 cookie 裸调接口，会被 `710010702` 直接拒绝。
+
+> **白话结论**：别的平台「钥匙」是静态 token/cookie，服务器存着就能自己签；豆包的「钥匙」是「浏览器当场算签名的能力」，只活在你本机登录着的浏览器里。所以必须借你本机（或服务器上的无头浏览器）当「签名代理」。
+
+为此本仓库提供两套方案（详见「第 9 步 · 豆包」）：
+- **方案一 · 本机自治（推荐起步）**：你本机常驻一个签名服务（`doubao_sign.js` + `doubao_signer.bat`），服务器只负责喊「该签了」，真签名在你本机 Edge 完成。已做崩溃自愈 + 开机自启，注册一次后您再也不用开 bat。
+- **方案二 · 搬到 112 服务器**：把签名代理挪到 112 上跑无头 Chromium（`doubao_sign_server.js`），您电脑关机也能签；登录态由本机 `doubao_sign.js` 每 30 分钟自动推给 112。
+
+⚠️ **诚实边界（两方案通用）**：豆包的「积分任务」（如生成 PPT、用某个技能等）本身仍需您在豆包**真做完**才领得到——平台校验真实使用，自动化只管「领」不管「做」。
 
 ---
 
@@ -51,6 +64,15 @@ workbuddy-signin/
 ├─ setup_task.ps1         ← 注册 Windows 计划任务（本机每日自动跑）
 ├─ install_autostart.bat  ← 网页服务开机后台自启（无需管理员）
 ├─ trae_capture.js        ← Trae Cookie 抓取脚本（本机从浏览器导出）
+│
+├─ ★ 豆包签名代理（Doubao）★
+├─ doubao_sign.js          ← 本机签名代理：Playwright 驱动 Edge 算 a_bogus 真签；每 30 分把 cookie 推给 112（方案二）
+├─ doubao_signer.bat       ← 本机签名服务启动器（启动前释放 8791 端口 + node 崩溃 5s 自愈循环）
+├─ install_doubao_autostart.bat ← 一键注册开机自启（双击即自动提权 + 注册计划任务 + 立即拉起）
+├─ setup_doubao_task.ps1   ← 注册 Windows 计划任务 DoubaoSignService（崩溃自动拉起兜底）
+├─ doubao_sign_server.js   ← 112 服务器签名代理：headless Chromium 代签（方案二）
+├─ wb-doubao-sign.service  ← 112 systemd 服务单元（方案二）
+├─ setup_doubao_server.sh  ← 112 一键安装脚本（装 Playwright/Chromium + 注入 DOUBAO_SIGNER_URL）
 │
 ├─ ★ 凭据 & 状态文件（平铺根目录，服务端平铺读取）★
 │   token.info  qf_token.txt  mm_token.json  mm_web_token.json  qoder_token.txt
@@ -91,6 +113,13 @@ workbuddy-signin/
 | `config.example.json` | 各平台凭据文件 / 环境变量 / 获取方式说明模板（不进仓库） |
 | `start_web.bat` | 启动网页版服务，打印手机访问地址 |
 | `install_autostart.bat` | 可选：网页版开机自动后台运行（无需管理员） |
+| `doubao_sign.js` | 本机豆包签名代理：Playwright 开真 Edge 算 `a_bogus` 真签；`/sync-cookie` 手动 + 每 30 分自动把 cookie 推给 112（方案二） |
+| `doubao_signer.bat` | 本机签名服务启动器：启动前释放 8791 端口防冲突 + node 崩溃 5s 自愈循环 |
+| `install_doubao_autostart.bat` | 一键注册豆包签名服务开机自启（双击即自动提权 + 注册计划任务 + 立即拉起） |
+| `setup_doubao_task.ps1` | 注册 Windows 计划任务 `DoubaoSignService`（登录自启 + 每日 08:20 保活；动态探测参数兼容旧版 Windows） |
+| `doubao_sign_server.js` | 112 服务器签名代理：headless Chromium 代签，读 `doubao_cookies_server.json` 登录态（方案二） |
+| `wb-doubao-sign.service` | 112 systemd 服务单元，拉起 `doubao_sign_server.js`（含 `--no-sandbox` 适配 root） |
+| `setup_doubao_server.sh` | 112 一键安装脚本：装 Playwright/Chromium/系统依赖 + 注册服务 + 给 `wb-checkin` 注入 `DOUBAO_SIGNER_URL` |
 
 > 凭证只**读取**不修改；脚本不会用 refreshToken 刷新，避免影响主程序登录态。
 
@@ -147,6 +176,7 @@ workbuddy-signin/
 | 即梦 AI | `jimeng_cookie.txt` | `JIMENG_COOKIE` | 浏览器登录 jimeng.jianying.com 后复制全部 Cookie（sessionid 即凭证） |
 | OiiOii AI | `oiioii_token.txt` | `OIICII_TOKEN` | 浏览器登录 oiioii.ai 后，从签到请求的 `Authorization: Bearer` 后复制 JWT（约 7 天有效；想长期可再提供 Supabase `session.json` 做自动续期） |
 | 华为码道 | `hw_cookie.txt` | `HW_COOKIE` | 由本机 `huawei/` 工具链自动同步；亦可在网页「🔑 配置会话 Cookie」粘贴登录态 |
+| **豆包 Doubao** | `doubao_cookie.txt`（本机浏览器导出） | `DOUBAO_COOKIE` | 见下方「第 9 步 · 豆包」（特殊架构，不能直接填 cookie 服务端签） |
 
 > 凭据文件与 `.env` 均已被 `.gitignore` 忽略，绝不会进仓库。
 
@@ -185,6 +215,45 @@ WorkBuddy 卡片底部的「🌱 成长中心」「🎯 每日任务」入口，
 - **服务器**：`systemctl enable --now wb-checkin-daily.timer`（每天 08:35）；或在「⚙ 设置」页填「定时签到时间」热更新。
 - **本机**：管理员 PowerShell 跑 `.\setup_task.ps1`（每天 09:10）。
 - 任一平台失败不影响其余（单平台失败不阻塞）。
+
+### 9. 🟣 豆包 Doubao：a_bogus 动态签名死结与两套方案
+
+豆包**不能像别的平台那样只靠 cookie 在服务端直接签**——它的写接口（签到、领积分）强制 `a_bogus` 动态签名，这串签名由豆包网页 JS 在你**真浏览器发请求那一刻**临时算出来，函数锁死在网页闭包里，服务器拿不到。服务器光持 cookie 裸调会被 `710010702` 拒绝。
+
+> 一句话：豆包的「钥匙」不是 cookie，是「浏览器当场算签名的能力」，只活在你本机浏览器里。所以必须借浏览器当「签名代理」。
+
+#### 9.1 方案一 · 本机自治（推荐起步，零新增依赖）
+
+逻辑：您本机常驻一个签名服务，**服务器只喊「该签了」，真签名在您本机 Edge 完成**。用的是您真实浏览器 + 住宅 IP，账号风险最低。
+
+1. **本机装依赖**：已装 Node 18+ 与 Playwright（`npm install playwright`；首次 `npx playwright install chromium`）。
+2. **导出豆包登录态**：用已登录豆包的 Edge，从 DevTools → Application → Cookies 复制全部 cookie，存为根目录 `doubao_cookie.txt`（或设环境变量 `DOUBAO_COOKIE`）。
+3. **一键开机自启（只需一次）**：双击 `install_doubao_autostart.bat`（UAC 点「是」）→ 自动注册计划任务 `DoubaoSignService`（登录自启 + 每日 08:20 保活 + 崩溃自动拉起）→ 立即拉起服务。之后**再也不用开 bat**。
+   - 验证：`schtasks /query /tn DoubaoSignService` 状态 `Ready` 即成功。
+4. **日常运行**：`doubao_signer.bat` 启动 `doubao_sign.js`（监听 `127.0.0.1:8791`，内含崩溃 5s 自愈循环）。它每 15 秒轮询 112 的「待签/待领」指令并执行。
+5. **手机网页**：豆包卡点「🎯 完成任务」打开弹窗，列出真实任务状态（✅已领 / 🎯可领 / ⏳待完成），底部「🎯 一键完成任务」即领积分；还有「📋 复制原始任务数据」便于排查。
+
+#### 9.2 方案二 · 搬到 112 服务器（电脑关机也能签）
+
+把「浏览器签名代理」从您本机搬到 112 上跑无头 Chromium，**每日自动跑，电脑关着也能签**。登录态仍在您本机，由 `doubao_sign.js` 每 30 分钟自动推给 112（偶尔没续到，用最后一次同步的 cookie 顶着，豆包 cookie 约 30 天有效）。
+
+**112 侧（一次性）**：
+```bash
+cd /opt/wb-checkin
+git pull                      # 取回 doubao_sign_server.js / web_server.py 等
+bash setup_doubao_server.sh   # 装 Playwright+Chromium+系统依赖、注册 wb-doubao-sign.service、给 wb-checkin 注入 DOUBAO_SIGNER_URL=127.0.0.1:8791
+systemctl status wb-doubao-sign   # active 即成功
+curl -s 127.0.0.1:8791/health     # 应返回 {"ok":true,"hasCookie":false}
+```
+**本机侧（持续）**：
+- 保持 `doubao_sign.js` 运行（它每 30 分钟把 cookie 推到 112 的 `POST /api/doubao/upload-cookie`）。
+- 部署完成后，本机浏览器开一次 `http://127.0.0.1:8791/sync-cookie` 立即推一版登录态；之后全自动续传。
+- 校验：`curl -s 127.0.0.1:8791/health` 的 `hasCookie` 变 `true`。
+
+> `web_server.py` 的 `run_doubao_checkin()` 已支持 `DOUBAO_SIGNER_URL`：112 设了该变量后，每日自动签到直接调 112 本机签名服务，**彻底不依赖您电脑**。
+
+#### 9.3 ⚠️ 诚实边界（两方案通用）
+豆包「积分任务」（生成 PPT、用某个技能、创建日程等）本身需您在豆包**真做完**才领得到——平台校验真实使用，自动化只管「领」不管「做」。未完成任务弹窗如实标「⏳ 待完成」，绝不伪造领取。
 
 ---
 
@@ -312,6 +381,11 @@ python3 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台
 - **Link AI 卡一直显示「需手动」，重新检查也没变已签**：这是预期的——Link AI 接口强制图片验证码，服务端代签不了，也无从得知你浏览器里的签到。请先在网页 `console.link-ai.tech` 手动签到，再回到卡片点「✅ 我已在网页签到」确认，卡片即标记「今日已签」（本地记录，每天重置，诚实不谎报）。
 - **OiiOii 卡一直显示「需网页手动签到」**：与 Link AI 同理——OiiOii 的领取接口（`/points/add`）强制腾讯云人机验证（`CAPTCHA_REQUIRED`），服务端无解验证码能力、无法自动代签。请先到 `oiioii.ai` 网页完成每日签到（过人机验证那一步），再回到卡片点「✅ 我已在网页签到」确认即可。卡片上的「可用积分」是真实查询值，状态如实显示。JWT 约 7 天失效后，重新从浏览器复制 `Authorization: Bearer` 后的那段更新 `oiioii_token.txt` 即可。
 - **设置改了不生效**：口令/通知即时生效；定时时间在保存时已热更新。若仍不对，确认 `settings.json` 已写入（被 gitignored，不会进仓库）。
+- **豆包卡显示「需本机签名」/ 点「完成任务」没反应**：豆包写接口强制 `a_bogus` 浏览器实时签名，必须本机（或 112）有签名代理在跑。本机方案：确认 `doubao_signer.bat` 已启动且 `schtasks /query /tn DoubaoSignService` 状态 `Ready`；服务器方案（方案二）：确认 `systemctl status wb-doubao-sign` 为 active 且 `curl 127.0.0.1:8791/health` 的 `hasCookie` 为 true（未推登录态会签不了）。
+- **豆包「一键完成任务」领不到积分**：豆包「积分任务」需您**在豆包真做完**（如真生成一次 PPT、真用某个技能），平台校验真实使用；未完成的任务弹窗会标「⏳ 待完成」，自动化无法替您做，也不伪造领取。
+- **本机每次都要开 bat 吗**：不用。双击一次 `install_doubao_autostart.bat` 注册开机自启后，登录即自动拉起、崩溃自动自愈，再也不用手动开（`install_doubao_autostart.bat` 是一次性安装器，不是每天要跑）。
+- **`doubao_signer.bat` 报 `EADDRINUSE: 8791`**：旧进程没退干净。bat 已内置启动前释放 8791；若仍报错，手动 `powershell "Get-NetTCPConnection -LocalPort 8791 | Stop-Process"` 再启动。
+- **豆包 cookie 过期了**：方案一本机重新从 Edge 导出 cookie 覆盖 `doubao_cookie.txt`；方案二本机保持 `doubao_sign.js` 运行即可自动续传（约 30 天有效，偶尔没续到用最后一次同步顶着）。
 
 ---
 
@@ -370,3 +444,11 @@ python3 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台
 - 签到领取：`POST https://api.oiioii.tv/points/add` body `{"type":"sign_in"}` —— **该接口强制要求腾讯云人机验证，返回 `CAPTCHA_REQUIRED`，服务端无解验证码能力，无法自动代签**。
 - **⚠️ 诚实模式（与 Link AI 同思路）**：卡片展示真实签到状态 + 可用积分，并提供「🌐 去官网签到」跳转与「✅ 我已在网页签到」本地确认按钮（`set_oiioii_manual_signed()` 写本地记录，每天重置，绝不谎报已签）；`run_oiioii_checkin()` 命中 `CAPTCHA_REQUIRED` 时**诚实返回未签状态、不伪造成功**。OiiOii 因此**不在 `AUTO_PLATFORMS` 自动签到列表**（每日定时不会去撞验证码），仅作手动卡呈现。
 - 凭据：`oiioii_token.txt`（JWT，约 7 天有效；环境变量 `OIICII_TOKEN` 优先）。想长期免重配，可把浏览器里的 Supabase `session.json`（含 `access_token`+`refresh_token`）放到 `oiioii_session.json`，适配器会在到期前自动用 `refresh_token` 续期（均 gitignored，等同账号密码，禁入库）。
+
+**豆包 Doubao**（对应 `get_doubao_card` / `run_doubao_checkin` + 本机 `doubao_sign.js` / 服务器 `doubao_sign_server.js`）：
+- **死结**：写接口（签到 `checkin`、领奖 `alice/ug/campaign/item/reward/claim`）强制 `a_bogus` 动态签名，由豆包网页 JS 在真实浏览器发请求时现场哈希（参数+时间戳+浏览器指纹），函数锁死在闭包，服务器无法复现；仅持 cookie 裸调 → `710010702` 拒绝。
+- **中继通道**：网页 `POST /api/doubao/request-sign`（签到）/`request-tasks`（领奖）写 pending → 本机/服务器签名器轮询 `GET /api/doubao/poll[-tasks]` 取指令 → 在真实浏览器内 fetch（自动带 a_bogus）→ 回写成功。
+- **任务真实字段**（校准过）：`campaign_code`（如 `browser_tool`、`pc_task_generate_ppt_v2`）、`campaign_group_code: pc_incentive_task_mvp_v3`、`reward_summaries:[{reward_amount,reward_type:"quota_grant"}]`、`task_status`（1=待完成 / 2=可领 / 3=已领）、`task_kind`（daily_signin / chat_activity）。**领奖只对已完成（status 2/3）领取**，未完成的如实标「待完成」。
+- **方案二登录态搬运**：本机 `doubao_sign.js` 每次成功操作后 + 每 30 分 + `/sync-cookie` 手动，把浏览器 context 的 cookie 推到 `POST /api/doubao/upload-cookie`（中心 key 鉴权），112 存 `doubao_cookies_server.json`；`doubao_sign_server.js` 读它代签。
+- **端口**：签名器监听 `127.0.0.1:8791`；`DOUBAO_SIGNER_URL` 指向它时，112 的 `run_doubao_checkin()` 直接调 `signer + "/sign"`。
+- **诚实映射**：仅对接口明确可领的任务领奖；任务积分需真实使用才可领，弹窗如实显示状态与失败 code，绝不谎报。

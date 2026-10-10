@@ -109,6 +109,12 @@ doubao_sign_request.json
 doubao_sign_request_tasks.json
 # 豆包「今日已签」防漏签状态（运行态）
 doubao_signed_today.json
+# 豆包方案二：服务器侧同步来的登录态 Cookie（等同账号密码，禁止入库）
+doubao_cookies_server.json
+# 豆包方案二：服务器侧浏览器 profile（含登录态，禁止入库）
+doubao_server_profile/
+# 豆包方案二：服务器签名器运行日志（运行态）
+doubao_sign_server.log
 
 # Trae 限流重试持久化状态（运行态，重启后由服务自动恢复）
 trae_retry_state.json
