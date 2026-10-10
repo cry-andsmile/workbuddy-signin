@@ -7,7 +7,7 @@ $bat = Join-Path $dir "doubao_signer.bat"
 $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$bat`""
 $tLogon = New-ScheduledTaskTrigger -AtLogOn
 $tDaily = New-ScheduledTaskTrigger -Daily -At "08:20"
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBattery -StartWhenAvailable
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBattery -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit 0
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($tLogon, $tDaily) -Settings $settings -Force
