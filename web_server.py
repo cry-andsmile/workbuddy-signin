@@ -609,6 +609,17 @@ def get_status():
     return st
 
 
+def _pre_checkin_chat(sess):
+    """签到前置：补一条简单对话（你好），满足 WorkBuddy「当天完成对话才能签到」的硬性要求。
+    官方服务端校验当天存在对话记录，否则 daily-checkin 不记录（签到空白/连登断开）。
+    对话失败不阻断后续签到尝试（尽力而为）。"""
+    try:
+        if wb_growth is not None:
+            wb_growth.chat_completion(sess, "deepseek-v4-flash", "你好")
+    except Exception:
+        pass
+
+
 def do_checkin():
     sess = _session()
     st = get_status()
@@ -619,6 +630,10 @@ def do_checkin():
             "message": "今天已经签到过了，无需重复操作",
             "status": st,
         }
+
+    # 前置：WorkBuddy 要求「当天完成一次对话」才算签到，先补发一条极简对话，
+    # 避免 daily-checkin 因「当天无对话」被服务端拒绝（签到空白/连登断的根因）。
+    _pre_checkin_chat(sess)
 
     s, b = call(_base(sess), "/daily-checkin", sess, {})
     try:

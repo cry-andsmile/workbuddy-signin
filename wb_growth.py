@@ -642,6 +642,11 @@ def run_daily(sess):
         if ci.get("today_checked_in"):
             add("checkin", True, "今日已签到", skipped=True)
         else:
+            # 前置：官方要求「当天完成一次对话」才算签到，先补发一条极简对话
+            try:
+                chat_completion(sess, "deepseek-v4-flash", "你好")
+            except Exception:
+                pass
             s, b = do_daily_checkin(sess)
             add("checkin", s == 200, "签到成功" if s == 200 else "签到失败 http=%s %s" % (s, _brief(b)))
     except Exception as e:
