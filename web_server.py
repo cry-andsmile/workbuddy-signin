@@ -4332,6 +4332,266 @@ def _travel_entry():
         "remain": tc.get("remain"), "location": tc.get("location"),
     }
 
+# ======================== 凭据到期预警 ========================
+# 为什么需要这个：各平台凭据「寿命」差得极远（Link AI 31 天、MiniMax 约 40 天、
+# Trae 约 60 天、WorkBuddy 约 28 天…）。而现有卡片只在**已经过期**之后才把角标换成
+# 「登录态过期」——用户往往当天要用了才发现，白白错过一次签到。
+# 这里把「还剩几天」提前算出来，放到卡面和一个汇总预警条上。
+#
+# 三条设计约定（改动前务必遵守）：
+#   1. **只读**：只解析凭据文件/环境变量，不发任何网络请求、不写任何文件、
+#      不缓存——凭据可能被随时替换（_lk_token() 等已改为现读盘），缓存会读到旧值。
+#   2. **如实**：算不出来就返回 None，卡片显示「未知」，绝不编数字糊弄人。
+#      （与「可用积分」查不到就诚实显示 — 的既有约定保持一致。）
+#   3. **单点汇聚**：只挂在 get_center() 上，11 个 get_*_card() 一行都不用改，
+#      也不会影响 /api/center/checkin 等只做签到不做展示的接口。
+
+CRED_WARN_DAYS = 7       # 剩余 <7 天 → 黄色预警
+CRED_URGENT_DAYS = 3     # 剩余 <3 天 → 红色预警（再不动手就要过期了）
+
+
+def _cred_read_text(path):
+    """读一个文本凭据文件，失败/不存在返回空串。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _cred_jwt_payload(text):
+    """从任意文本里抠出第一个像样的 JWT，返回其 payload dict；抠不到返回 None。
+
+    注意：这里**故意不验签**。我们只需要 exp（过期时间戳），而验签需要各平台的
+    公钥/密钥，且凭据本就由我们自己下发——签名真伪不影响「它什么时候过期」。
+    """
+    import re as _re
+    m = _re.search(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", text or "")
+    if not m:
+        return None
+    try:
+        seg = m.group(0).split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        import base64 as _b64
+        return json.loads(_b64.urlsafe_b64decode(seg.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _cred_parse_ts(v):
+    """把各平台花式的时间表示统一成 epoch 秒；认不出返回 None。
+
+    支持：
+      · 秒/毫秒时间戳（workbuddy 的 auth.expiresAt 是毫秒，形如 1794532329441）
+      · ISO 字符串（形如 2026-10-20T06:00:51Z / 2026-10-20 06:00:51）
+    """
+    import datetime as _dt
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if f <= 0:
+            return None
+        # 毫秒级（>1e11）按毫秒折算；秒级直接用
+        return f / 1000.0 if f > 1e11 else f
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return float(s)          # 纯数字字符串
+        except Exception:
+            pass
+        s = s.replace("Z", "+00:00").replace("T", " ")
+        try:
+            d = _dt.datetime.fromisoformat(s)
+            if d.tzinfo is not None:
+                d = d.replace(tzinfo=None)
+            return d.timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def _cred_trae_expiry():
+    """Trae 的凭据有效期（现算）。
+
+    优先用静态 JWT（TRAE_JWT / trae_jwt.txt）的 exp；没有 JWT 时退回从
+    trae_cookie.json 里取登录关键 cookie 的 expires。
+    """
+    jwt = (os.environ.get("TRAE_JWT", "") or "").strip() or \
+          _cred_read_text(TRAE_JWT_FILE).strip()
+    if jwt:
+        p = _cred_jwt_payload(jwt)
+        ts = _cred_parse_ts((p or {}).get("exp"))
+        if ts:
+            return ts, "Trae JWT exp"
+    # 退回 cookie：登录态靠 sessionid / X-Cloudide-Session 等，取其中**最早**过期的
+    # （短板效应：会话里任何一个关键 cookie 过期都会导致整体失效）
+    raw = _cred_read_text(os.path.join(BASE_DIR, "trae_cookie.json"))
+    if not raw:
+        return None, None
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        return None, None
+    if not isinstance(arr, list):
+        return None, None
+    KEY = ("sessionid", "x-cloudide-session", "passport_auth_status", "sid_guard")
+    best = None
+    for c in arr:
+        if not isinstance(c, dict):
+            continue
+        nm = str(c.get("name", "")).lower()
+        if nm not in KEY:
+            continue
+        ts = _cred_parse_ts(c.get("expires"))
+        if ts and (best is None or ts < best[0]):
+            best = (ts, "Cookie " + str(c.get("name")))
+    if best:
+        return best[0], best[1]
+    return None, None
+
+
+def _cred_expiry_raw(name):
+    """取平台「最原始的凭据文本」，交给 _cred_expiry_from_text 解析。
+
+    只做取文本，不做判断——这样新增平台时只要补一行文件名即可。
+    """
+    if name == "workbuddy":
+        # token.info 是 JSON，里面 auth.expiresAt 是**毫秒**权威值
+        wb = os.environ.get("WB_TOKEN_FILE") or ""
+        return _cred_read_text(wb) if wb else _cred_read_text(os.path.join(BASE_DIR, "token.info"))
+    if name == "linkai":
+        return (os.environ.get("LINKAI_TOKEN", "") or "").strip() or \
+               _cred_read_text(os.path.join(BASE_DIR, "linkai_token.txt"))
+    if name == "minimax":
+        return (os.environ.get("MM_WEB_TOKEN", "") or "").strip() or \
+               _cred_read_text(os.path.join(BASE_DIR, "mm_web_token.json"))
+    if name == "qianfan":
+        return (os.environ.get("QF_ACCESS_TOKEN", "") or "").strip() or \
+               _cred_read_text(os.path.join(BASE_DIR, "qf_token.txt"))
+    if name == "qoder":
+        return (os.environ.get("QODER_TOKEN", "") or "").strip() or \
+               _cred_read_text(os.path.join(BASE_DIR, "qoder_token.txt"))
+    # coze / jimeng / lingxi / huawei / doubao：目前只有「name=val;」纯 Cookie 串，
+    # 不带过期信息（浏览器 DevTools 导出的 JSON 才有 expires，普通 Cookie 头串里没有），
+    # 故一律按「未知」处理，不猜。
+    return ""
+
+
+def _cred_expiry_from_text(raw):
+    """兜底解析：从任意凭据文本里尽量挖出 (ts, basis)。
+
+    顺序：JWT exp → `expiresAt=` 注释（部署脚本有时会写在文件末尾）。
+    认不出来返回 (None, None)，交给上层显示「未知」。
+    """
+    if not raw:
+        return None, None
+    p = _cred_jwt_payload(raw)
+    ts = _cred_parse_ts((p or {}).get("exp"))
+    if ts:
+        return ts, "JWT exp"
+    import re as _re
+    m = _re.search(r"expiresAt\s*[=:]\s*([0-9]{9,}|[0-9T:\- ]{8,25})", raw)
+    if m:
+        ts = _cred_parse_ts(m.group(1))
+        if ts:
+            return ts, "expiresAt"
+    return None, None
+
+
+def cred_expiry(name):
+    """返回平台凭据到期信息 dict；**算不出来一律返回 None**（网页显示「未知」）。
+
+    字段：
+      days(float)/d(int)   剩余天数（可能为负，负=已过期）
+      at(str)              "MM-DD HH:mm" 到期时刻
+      basis(str)           判断依据，如 "JWT exp" / "token.info expiresAt"
+      level(str)           ok / soon / urgent / expired
+      label(str)           给卡片用的中文说明，如 "还剩 5 天"
+    """
+    ts, basis = None, None
+    try:
+        if name == "workbuddy":
+            # 优先 token.info 里 auth.expiresAt（权威，毫秒），失败再退回 JWT exp
+            raw = _cred_expiry_raw(name)
+            try:
+                d = json.loads(raw) if raw else None
+                ts = _cred_parse_ts(((d or {}).get("auth") or {}).get("expiresAt"))
+                if ts:
+                    basis = "token.info expiresAt"
+            except Exception:
+                ts = None
+        if ts is None and name == "trae":
+            ts, basis = _cred_trae_expiry()
+        if ts is None:
+            ts, basis = _cred_expiry_from_text(_cred_expiry_raw(name))
+        if ts is None:
+            return None
+    except Exception:
+        # 预警功能绝不能让整页挂掉：任何异常都退化成「未知」
+        return None
+
+    days = (float(ts) - time.time()) / 86400.0
+    if days < 0:
+        level = "expired"
+    elif days < CRED_URGENT_DAYS:
+        level = "urgent"
+    elif days < CRED_WARN_DAYS:
+        level = "soon"
+    else:
+        level = "ok"
+    at = datetime.datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M")
+    di = int(days) if days > 0 else 0
+    if level == "expired":
+        label = "已过期（%s）" % at
+    elif days < 1:
+        label = "不足 1 天（%s）" % at
+    else:
+        label = "还剩 %d 天（%s）" % (di, at)
+    return {"days": round(days, 1), "d": di, "at": at, "basis": basis,
+            "level": level, "label": label}
+
+
+def _decorate_cred_expiry(items):
+    """给 get_center() 的 items 就地挂上凭据到期信息，并返回预警汇总。
+
+    做三件事：
+      1) it["cred_expiry"]  —— 供前端/详情弹窗取用（未知则不挂该字段）
+      2) it["rows"] 追加一行「凭据有效期」——卡片上直接可见
+      3) 返回 alerts 列表（即将过期/已过期的平台），供页顶预警条使用
+    """
+    alerts = []
+    for it in items:
+        try:
+            name = it.get("name")
+            info = cred_expiry(name)
+            if not info:
+                continue
+            it["cred_expiry"] = info
+            rows = it.get("rows")
+            if not isinstance(rows, list):
+                rows = []
+                it["rows"] = rows
+            mark = {"expired": "🔴", "urgent": "🔴", "soon": "🟡", "ok": "🟢"}.get(info["level"], "")
+            rows.append({"k": "凭据有效期", "v": "%s %s" % (mark, info["label"])})
+            if info["level"] in ("expired", "urgent", "soon"):
+                alerts.append({
+                    "name": name,
+                    "title": it.get("title") or name,
+                    "level": info["level"],
+                    "label": info["label"],
+                    "days": info["days"],
+                })
+        except Exception:
+            continue
+    # 紧急的排前面，同级按剩余天数从少到多
+    order = {"expired": 0, "urgent": 1, "soon": 2}
+    alerts.sort(key=lambda a: (order.get(a["level"], 9), a.get("days", 0)))
+    return alerts
+
+
 def get_center():
     # 并发拉取各平台卡片 + 子卡，单平台最多 8s；任一平台慢/卡死只标记超时，绝不拖累整页。
     order = list(ADAPTERS.keys())
@@ -4394,6 +4654,8 @@ def get_center():
             it["growth_entry"] = g_entry
             it["daily_entry"] = d_entry
             it["travel_entry"] = t_entry
+    # 凭据到期预警：给每张卡补一行「凭据有效期」，并汇总出需要预警的平台
+    cred_alerts = _decorate_cred_expiry(items)
     return {
         "ok": True,
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -4402,6 +4664,8 @@ def get_center():
         # 概览条要用的调度信息（前端不用再单独打一次 /api/settings）
         "schedule_enabled": bool(SETTINGS.get("schedule_enabled", True)),
         "schedule_time": SETTINGS.get("schedule_time", "08:35"),
+        # 凭据到期预警：[{name,title,level,label,days}]；没有就空数组
+        "cred_alerts": cred_alerts,
         "items": items,
     }
 
@@ -4541,6 +4805,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
 .cta.ghost.slim{width:auto;margin-top:0;padding:11px 18px;}
 .tab-hint{font-size:12px;color:var(--sub);line-height:1.5;flex:1;min-width:160px;}
 .tab-hint.block{display:block;flex:none;width:100%;margin-bottom:14px;padding:11px 14px;border-radius:12px;grid-column:1/-1;}
+/* ===== 凭据到期预警条（卡片上面，黄/红两档）===== */
+#credAlert{margin:0 0 12px;}
+#credAlert:empty{display:none;}
+#credAlert .ca{display:flex;gap:9px;align-items:flex-start;padding:10px 12px;border-radius:12px;
+  border:1px solid #fed7aa;background:#fff7ed;color:#9a3412;font-size:12.5px;line-height:1.55;}
+#credAlert .ca.bad{border-color:#fecaca;background:#fef2f2;color:#b91c1c;}
+#credAlert .ca .ci{font-size:14px;line-height:1.3;}
+#credAlert .ca .cb{flex:1;min-width:0;}
+#credAlert .ca .ct{font-weight:800;}
+#credAlert .ca .cl{margin-top:2px;}
+#credAlert .ca .cl b{font-weight:800;font-variant-numeric:tabular-nums;}
+#credAlert .ca .cl .sep{opacity:.45;margin:0 5px;}
+#credAlert .ca .cd{margin-top:5px;font-size:11.5px;opacity:.82;}
+#credAlert .ca .cx{flex:none;border:0;background:transparent;color:inherit;opacity:.5;cursor:pointer;
+  font-size:15px;line-height:1;padding:2px 3px;}
+#credAlert .ca .cx:hover{opacity:.9;}
   background:rgba(247,144,9,.08);color:#b54708;border:1px solid rgba(247,144,9,.18);}
 .badge.manual{color:#b54708;background:rgba(247,144,9,.13);}
 .card.manual-card{cursor:default;}
@@ -4790,6 +5070,8 @@ button.entry:hover{background:#eef7f4;}
   </div>
 
   <div id="tabs"></div>
+
+  <div id="credAlert"></div>
 
   <div id="cards"><div class="loading">加载中…</div></div>
   <div id="focus" style="display:none"></div>
@@ -5395,10 +5677,18 @@ consumeHTML += pkgs.map(function(p){
   }
   // 统一官网登录入口：从已加载的 center 数据里取该卡的 official_url
   var off = null;
+  var credExp = null;
   if(LAST_CENTER && LAST_CENTER.items){
     for(var oi=0; oi<LAST_CENTER.items.length; oi++){
-      if(LAST_CENTER.items[oi].name===name){ off = LAST_CENTER.items[oi].official_url; break; }
+      if(LAST_CENTER.items[oi].name===name){ off = LAST_CENTER.items[oi].official_url; credExp = LAST_CENTER.items[oi].cred_expiry; break; }
     }
+  }
+  // 凭据有效期：卡片上已有，这里从 LAST_CENTER 里取同一份数据补进弹窗，
+  // 保证「卡片能看到的信息」在详情页同样能看到，不用为 11 个平台各写一套。
+  if(credExp && credExp.label){
+    var _cm = {expired:'🔴',urgent:'🔴',soon:'🟡',ok:'🟢'}[credExp.level] || '';
+    signinHTML += '<div class="drow"><span class="dk">凭据有效期</span><span class="dv">'
+                + esc(_cm + ' ' + credExp.label) + '</span></div>';
   }
   var offFoot = off
     ? '<div class="dfoot"><a class="olink" href="'+esc(off)+'" target="_blank" rel="noopener">🌐 前往官网登录 / 账号管理</a></div>'
@@ -5616,6 +5906,7 @@ function bindFocusButtons(el){
 function showFocus(view){
   var sum=document.querySelector('.summary'); if(sum) sum.style.display='none';
   var cards=$('cards'); if(cards) cards.style.display='none';
+  var ca=$('credAlert'); if(ca) ca.style.display='none';
   var hint=document.querySelector('.hint'); if(hint) hint.style.display='none';
   var h1=document.querySelector('.brand h1'); if(h1) h1.textContent = (view==='growth'?'成长中心':(view==='settings'?'设置':'每日任务'));
   var p=document.querySelector('.brand p'); if(p) p.textContent = (view==='settings'?'傻瓜式配置你的签到中心':'WorkBuddy 成长中心');
@@ -5629,6 +5920,7 @@ function showFocus(view){
 function showMain(){
   var sum=document.querySelector('.summary'); if(sum) sum.style.display='';
   var cards=$('cards'); if(cards) cards.style.display='';
+  var ca=$('credAlert'); if(ca) ca.style.display='';
   var hint=document.querySelector('.hint'); if(hint) hint.style.display='';
   var h1=document.querySelector('.brand h1'); if(h1) h1.textContent='签到中心';
   var p=document.querySelector('.brand p'); if(p) p.textContent='多个签到一目了然 · 一键完成';
@@ -5766,12 +6058,40 @@ function fmtNum(v){
   // 去掉无意义的尾随 0：1230.00 -> 1230，12.30 -> 12.3
   return String(Math.round(n * 100) / 100);
 }
+function renderCredAlert(alerts){
+  // 凭据到期预警条：把即将过期/已过期的平台点名列出，已过期的走红档。
+  var el = $('credAlert'); if(!el) return;
+  var list = alerts||[];
+  if(!list.length){ el.innerHTML=''; return; }
+  var bad = list.some(function(a){ return a.level!=='soon'; });
+  var names = list.map(function(a){
+    return '<b>'+esc(a.title||a.name)+'</b>（'+esc(a.label)+'）';
+  }).join('<span class="sep">·</span>');
+  el.innerHTML = '<div class="ca'+(bad?' bad':'')+'">'
+    + '<div class="ci">'+(bad?'🔴':'🟡')+'</div>'
+    + '<div class="cb">'
+    +   '<div class="ct">'+esc(list.length+' 个平台凭据'+(bad?'马上要过期/已过期':'即将过期'))+'</div>'
+    +   '<div class="cl">'+names+'</div>'
+    +   '<div class="cd">到期后卡片会显示「登录态过期」、当天签到也会失败。'
+    +   '按 README「配置各平台凭据」更新对应文件即可（大多是重新登录后复制新值）。</div>'
+    + '</div>'
+    + '<button class="cx" type="button" title="知道了" aria-label="关闭">×</button>'
+    + '</div>';
+  var x = el.querySelector('.cx');
+  if(x){ x.addEventListener('click', function(){ el.innerHTML=''; }); }
+}
 function renderStats(d, items){
   var el = $('stats'); if(!el) return;
   var live = items.filter(function(it){ return !it.disabled; });
   // 需维护：手动组里未签到 / 凭据失效 / 带 error 的（诚实计数，不掩盖故障）
+  // 另外把「凭据即将过期/已过期」也算进来——那同样是待办事项，且比已过期更容易补救。
+  var credWarn = function(it){
+    var ce = it.cred_expiry;
+    return !!(ce && (ce.level==='expired'||ce.level==='urgent'||ce.level==='soon'));
+  };
   var todo = live.filter(function(it){
-    return it.group==='manual' ? (!it.checked || it.needs_auth) : (it.needs_auth || it.error);
+    var cw = credWarn(it);
+    return it.group==='manual' ? (!it.checked || it.needs_auth || cw) : (it.needs_auth || it.error || cw);
   }).length;
   // 可用积分：各平台 credit.balance 求和（少数平台单位不同或为 —，跳过）
   var bal = 0, hasBal = false;
@@ -5815,6 +6135,7 @@ function renderCenter(d){
   var autoDone = auto.filter(function(it){ return it.checked && !it.disabled; }).length;
   var manualTodo = manual.filter(function(it){ return !it.checked || it.needs_auth; }).length;
   renderStats(d, d.items);
+  renderCredAlert(d.cred_alerts);
   renderTabs(auto.length, autoDone, manual.length, manualTodo);
   // 底部说明随分组状态自适应：全部自动化时不再提「两个标签」，避免与界面不符
   var hintEl = $('pgHint');
