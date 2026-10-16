@@ -18,6 +18,18 @@
 const { chromium } = require('C:/Users/54004/.workbuddy/binaries/node/workspace/node_modules/playwright-core');
 const http = require('http');
 const fs = require('fs');
+
+// ============================================================================
+// 【必填】网页签到中心访问口令（对应服务器 WB_ACCESS_KEY）
+// ----------------------------------------------------------------------------
+// 中继通道用它调用 https://bjzjsf.asia/checkin/api/doubao/*?k=<口令>。
+// 本文件是浏览器/Node 用户脚本，没有构建步骤可注入环境变量，所以只能手填。
+// 请从你自己的 .env（ACCESS_KEY=）里复制真实值到下面这行，不要把真实口令提交：
+//   const RELAY_KEY = '你自己的访问口令';
+// 留空 / 保持占位符时，中继轮询会因口令不符被服务器拒绝，其余功能不受影响。
+// ============================================================================
+const RELAY_KEY = 'PUT_YOUR_ACCESS_KEY_HERE';
+
 const path = require('path');
 
 const PROFILE    = 'E:/workspace/workbuddy-signin/doubao_profile';
@@ -43,15 +55,30 @@ let _browserPromise = null;
 let _signing = false;
 
 async function getBrowser() {
-  if (!_browserPromise) {
-    _browserPromise = chromium.launchPersistentContext(PROFILE, {
-      channel: 'msedge',
-      headless: true,
-      viewport: { width: 1280, height: 900 },
-      args: ['--no-first-run', '--no-default-browser-check', '--disable-blink-features=AutomationControlled'],
-    });
+  if (_browserPromise) {
+    try {
+      const ctx = await _browserPromise;
+      // 探活：能读到 cookie 说明 context 仍可用；浏览器已崩溃/被关闭会抛错
+      await ctx.cookies();
+      return ctx;
+    } catch (e) {
+      dlog('[browser] 复用的浏览器已失效，重建: ' + String(e).slice(0, 160));
+      try { const old = await _browserPromise; await old.close(); } catch (_) {}
+      _browserPromise = null;
+    }
   }
-  return _browserPromise;
+  const p = chromium.launchPersistentContext(PROFILE, {
+    channel: 'msedge',
+    headless: true,
+    viewport: { width: 1280, height: 900 },
+    args: ['--no-first-run', '--no-default-browser-check', '--disable-blink-features=AutomationControlled'],
+  });
+  _browserPromise = p;
+  // 【关键】启动失败必须清空缓存，否则一次瞬态失败会把服务永久锁死（旧版即此 bug：
+  // 浏览器崩溃/被更新杀掉后，_browserPromise 永远是那个 rejected promise，之后每次都直接抛
+  // "Target page, context or browser has been closed"，且进程不退出 → bat 自愈循环也救不回来）。
+  p.catch(() => { if (_browserPromise === p) _browserPromise = null; });
+  return p;
 }
 
 // 方案二支持：把当前浏览器里的豆包登录态(cookie)推送到 112，供服务器签名器代签。
@@ -61,6 +88,13 @@ async function uploadCookiesToServer() {
     const ctx = await getBrowser();
     const cookies = await ctx.cookies();
     if (!cookies || !cookies.length) return;
+    // 同步写回本机 doubao_cookie.txt：本机 web_server 的豆包卡片也按这个文件判断状态，
+    // 不写回会导致「本机卡片显示未签到、实际已签」的同类陈旧问题（与 112 上 10-12 的 bug 同源）。
+    // 只写裸 sessionid，loadCookieHeader() 已兼容该格式（第 36 行）。
+    try {
+      const sid = (cookies.find(c => c.name === 'sessionid') || {}).value;
+      if (sid) fs.writeFileSync(COOKIE_TXT, sid);
+    } catch (e) { dlog('[cookie-sync] 写本机 cookie 文件失败(可忽略): ' + e); }
     const r = await fetch('https://bjzjsf.asia/checkin/api/doubao/upload-cookie?k=' + encodeURIComponent(RELAY_KEY), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -115,6 +149,8 @@ async function doSign() {
 
     await page.close();
     uploadCookiesToServer();
+    // 只有签到接口真返回 code=0 才标记「今日已签」，避免失败也被误记导致保活不再重试
+    if (result && result.checkin && result.checkin.code === 0) markSignedToday();
     return { ok: true, result };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -382,7 +418,7 @@ scheduleAt(8, 30, doTasks, '自动领积分(晨)');
 scheduleAt(20, 0, doTasks, '自动领积分(晚)');
 
 // ---- 中继通道：轮询 112 上的待处理请求（解决 HTTPS 页无法直接 fetch 本机 http 服务）----
-const RELAY_KEY = '19921010';
+// RELAY_KEY（访问口令）定义在文件顶部的【必填】区，避免口令散落在源码中段。
 function startRelay() {
   // 签到请求轮询
   setInterval(async () => {
@@ -411,6 +447,20 @@ function startRelay() {
 }
 startRelay();
 
+// ---- 浏览器健康看门狗：定期探活，发现 Edge context 已死就清缓存，下一次调用自动重建 ----
+// 覆盖「浏览器被 Edge 自动更新/崩溃杀掉、但 node 进程还活着」——旧版正是这种场景下永久瘫痪。
+setInterval(async () => {
+  if (_signing || !_browserPromise) return;
+  try {
+    const ctx = await _browserPromise;
+    await ctx.cookies();
+  } catch (e) {
+    dlog('[watchdog] 浏览器探活失败，重置缓存待重建: ' + String(e).slice(0, 140));
+    try { const old = await _browserPromise; await old.close(); } catch (_) {}
+    _browserPromise = null;
+  }
+}, 3 * 60 * 1000);
+
 // ---- 防漏签：启动补签 + 每 20 分钟保活（覆盖电脑睡眠错过 08:25 定时 / 进程重启遗漏）----
 const SIGN_STATE = path.join(__dirname, 'doubao_signed_today.json');
 function signedTodayFlag() {
@@ -427,7 +477,9 @@ async function ensureSignedToday() {
   dlog('[doubao-sign] 保活补签：今日尚未签到，尝试...');
   try {
     const r = await doSign();
-    if (r && r.ok) markSignedToday();
+    // 以签到接口真实返回为准（doSign 内部已标记，这里再兜底一次），失败则下次保活继续重试
+    const chk = r && r.result && r.result.checkin;
+    if (r && r.ok && chk && chk.code === 0) markSignedToday();
     dlog('[doubao-sign] 保活补签结果: ' + JSON.stringify(r && r.result ? r.result : r).slice(0, 200));
   } catch (e) { dlog('[doubao-sign] 保活补签出错: ' + e); }
 }

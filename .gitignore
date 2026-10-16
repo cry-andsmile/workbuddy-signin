@@ -70,7 +70,11 @@ trae_cookie.json
 doubao_cookie.txt
 doubao_cookie.json
 linkai_token.txt
-# OiiOii 登录态（Supabase access token / session，等同账号密码，禁止入库）
+# 凭据文件的本地备份（形如 xxx_token.txt.bak.20261016），同样含明文凭据，禁止入库
+*.bak.[0-9]*
+*.bak.*[0-9]
+# OiiOii 已下线（平台价值低，卡片已移除）；下面两行保留，防止 _removed_oiioii/ 里
+# 遗留的旧凭据被误入库（等同账号密码）
 oiioii_token.txt
 oiioii_session.json
 lx_cookie.txt
@@ -136,4 +140,11 @@ qoder_local_status.json
 # 临时 commit message / 调试脚本（排查接口时临时生成，含密码或非交付物，禁止入库）
 _*.txt
 _*.py
+
+# WorkBuddy 会话令牌自动刷新：运行日志（运行态，非交付物）
+token_sync.log
+# 余额每日快照（运行态数据，由 workbuddy_checkin.py 每日写入）
+balance_history.json
+# 本机智能体工作目录数据（会话日志 / 项目记忆，禁止入库）
+.workbuddy-ai/
 

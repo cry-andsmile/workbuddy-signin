@@ -8,9 +8,22 @@
 
 ## 它能签到哪些平台
 
-卡片顺序 = `web_server.py` 中 `ADAPTERS` 字典的插入顺序。**共 12 张卡**：多数可全自动（WorkBuddy / 千帆 / MiniMax / 即梦 / 灵犀 / Trae / Coze）；Link AI、OiiOii 因接口强制人机验证（Link AI 图片验证码 / OiiOii 腾讯云验证码），服务端无法代签，需网页手动签到后卡片「✅ 我已在网页签到」确认；Qoder 卡片仍展示，但每日 100 Credits 因官方限制需**桌面端手动领**（不在服务端自动签到列表）；华为为手动卡，支持**网页粘贴会话 Cookie 直接登录**；**豆包为「浏览器签名代理」架构**——详见下方「第 9 步 · 豆包」。
+卡片顺序 = `web_server.py` 中 `ADAPTERS` 字典的插入顺序。**共 11 张卡**。
 
-> 所有卡片底部统一显示「可用积分」（5 家真实有余额：即梦 / 千帆 / WorkBuddy / Link AI / OiiOii；其余接口不提供余额则诚实显示「—」）；即梦额外显示「88 积分将于 x月x日 过期」提示。
+> **2026-10-16 起，11 张卡全部属于「🤖 自动签到」分组，不再有「✋ 手动签到」分组**
+> （手动分组为空时，该 tab 会自动隐藏）。改动记录：
+> - **Link AI** 原为手动卡（接口强制图片验证码、服务端无法代签）；
+>   现已在 `lk_captcha_solver.py` 里实现**滑块验证码自动破解**，
+>   端到端实测签到成功，**无需再手动操作**。详见下方 FAQ。
+> - **华为码道** 其实是全自动的（`hw_last_run.json` 显示每天 08:31 自动 +1000 积分、
+>   从未失败）；之前误放在手动组，是因为其 Cookie 短效需偶尔重登，
+>   但那属于「维护凭据」而非「手动签到」。
+>
+> Qoder 卡片仍展示，但每日 100 Credits 因官方限制需**桌面端领取**
+> （由本机守护完成，不在服务端自动签到列表）。
+> **豆包为「浏览器签名代理」架构**——详见下方「第 9 步 · 豆包」。
+
+> 所有卡片底部统一显示「可用积分」（4 家真实有余额：即梦 / 千帆 / WorkBuddy / Link AI；其余接口不提供余额则诚实显示「—」）；即梦额外显示「88 积分将于 x月x日 过期」提示。
 
 | 平台 | 官网 | 每日奖励 | 凭据文件（根目录） | 维护频率 |
 |------|------|---------|------------------|----------|
@@ -18,12 +31,11 @@
 | 百度千帆 | qianfan.baidu.com | — | `qf_token.txt`（另一台 ECS 同步） | 自动 |
 | MiniMax Code | platform.minimax.io | 400 智点 | `mm_web_token.json` | 约 40 天，过期重新登录 |
 | Qoder | qoder.com | 100 Credits（本机守护自动领） | `qoder_token.txt` | 约 1 个月，失效重新取出 |
-| Link AI | console.link-ai.tech | 需网页手动签到后卡片确认（接口强制图片验证码，服务端无法代签） | `linkai_token.txt` | 不定期 |
+| Link AI | console.link-ai.tech | 每日签到随机积分（**已实现自动绕过滑块验证码**，见下方 FAQ） | `linkai_token.txt` | 不定期 |
 | WPS 灵犀 | lingxi.wps.cn | 100 智点 | `lx_cookie.txt` | 不定期需重新导出 Cookie |
 | Trae Work | work.trae.cn | 150+50 积分 | `trae_cookie.txt` | 约 14 天，需重新导出 Cookie |
 | **Coze 扣子** | coze.cn | 1500 活动分（登录自动发） | `coze_cookie.txt` | 约 60 天，过期重新导出 Cookie |
 | 即梦 AI | jimeng.jianying.com | 每日登录发放免费额度（实测 88 赠送积分） | `jimeng_cookie.txt` | 字节风控强，Cookie 周期失效需重捕 |
-| OiiOii AI | oiioii.ai | 每日签到积分（可用余额实时查询） | `oiioii_token.txt`（Supabase 登录 JWT，约 7 天有效） | 接口强制腾讯云人机验证，服务端无法代签；网页手动签到后卡片确认 |
 | 华为码道（手动卡） | devcloud.cn-north-4.huaweicloud.com | — | `hw_cookie.txt`（本机 `hw_autopush.py` 自动同步；亦支持网页「🔑 配置会话 Cookie」粘贴登录） | 会话失效后双击 `huawei/relogin_huawei.bat` |
 | **豆包 Doubao** | doubao.com / 豆包 PC 客户端 | 每日签到 + 积分任务领奖 | 浏览器实时算签代持（详见下方「第 9 步 · 豆包」） | 随会话（约 30 天，靠本机续传） |
 
@@ -33,9 +45,9 @@
 >
 > 卡片为响应式 CSS Grid：`<600px 单列 / ≥600px 两列 / ≥920px 三列 / ≥1240px 四列`；详情是**真模态弹窗**（× / 点遮罩 / Esc 三种关闭），每卡右下角「🌐 前往官网登录」跳官方站点。
 
-### 🟣 豆包 Doubao（第 12 张卡 · 浏览器签名代理架构）
+### 🟣 豆包 Doubao（第 3 张卡 · 浏览器签名代理架构）
 
-豆包是这 12 家里**唯一不能纯靠静态 token/cookie 在服务端直接签**的平台，因为它在签到/领积分的写接口上强制一道 **`a_bogus` 动态签名**：这串签名由豆包网页 JS 在你**真浏览器发请求的那一刻**临时算出来（把请求参数 + 时间戳 + 浏览器指纹搅一起哈希），算签函数锁死在网页闭包里，服务器根本拿不到。服务器光持你的 cookie 裸调接口，会被 `710010702` 直接拒绝。
+豆包是这 11 家里**唯一不能纯靠静态 token/cookie 在服务端直接签**的平台，因为它在签到/领积分的写接口上强制一道 **`a_bogus` 动态签名**：这串签名由豆包网页 JS 在你**真浏览器发请求的那一刻**临时算出来（把请求参数 + 时间戳 + 浏览器指纹搅一起哈希），算签函数锁死在网页闭包里，服务器根本拿不到。服务器光持你的 cookie 裸调接口，会被 `710010702` 直接拒绝。
 
 > **白话结论**：别的平台「钥匙」是静态 token/cookie，服务器存着就能自己签；豆包的「钥匙」是「浏览器当场算签名的能力」，只活在你本机登录着的浏览器里。所以必须借你本机（或服务器上的无头浏览器）当「签名代理」。
 
@@ -56,11 +68,15 @@ workbuddy-signin/
 ├─ wb_travel.py           ← 派猫猫旅行（WorkBuddy 卡内弹窗）逻辑
 ├─ wb_growth.py           ← WorkBuddy 成长中心 / 每日任务 一键完成
 ├─ workbuddy_checkin.py   ← 核心签到逻辑（找 token → 查状态 → 签到，CLI 供 timer）
+├─ wb_token_dump.js       ← 新版客户端会话解密器：用 WorkBuddy 自带二进制（Node 模式）取主密钥，
+│                            把加密的 workbuddy-desktop.info 还原成明文（零依赖）
+├─ wb_token_sync.py       ← 令牌刷新编排：解密 → 原子写 token.info → 推送到 112（SFTP 优先，HTTP 兜底）
+├─ run_token_sync.bat     ← 手动刷新令牌（run_checkin.bat 每次也会自动先跑一遍）
 ├─ deploy_ui.py           ← 最小化 UI 部署：传 web_server.py + 凭据、重启 wb-checkin（不碰口令）
 ├─ envconf.py             ← 本地运维脚本统一从 .env 读 ECS/ACCESS_KEY
 ├─ config.example.json    ← 各平台凭据文件/环境变量说明模板（不进仓库）
 ├─ start_web.bat          ← 启动网页服务并打印手机访问地址
-├─ run_checkin.bat        ← 本机手动跑一次每日签到
+├─ run_checkin.bat        ← 本机手动跑一次每日签到（内含令牌自动刷新）
 ├─ setup_task.ps1         ← 注册 Windows 计划任务（本机每日自动跑）
 ├─ install_autostart.bat  ← 网页服务开机后台自启（无需管理员）
 ├─ trae_capture.js        ← Trae Cookie 抓取脚本（本机从浏览器导出）
@@ -76,7 +92,7 @@ workbuddy-signin/
 │
 ├─ ★ 凭据 & 状态文件（平铺根目录，服务端平铺读取）★
 │   token.info  qf_token.txt  mm_token.json  mm_web_token.json  qoder_token.txt
-│   linkai_token.txt  lx_cookie.txt  trae_cookie.txt  coze_cookie.txt  jimeng_cookie.txt  oiioii_token.txt
+│   linkai_token.txt  lx_cookie.txt  trae_cookie.txt  coze_cookie.txt  jimeng_cookie.txt
 │   hw_cookie.txt（注：实际由 huawei/ 工具链产生并推送）
 │   settings.json  *_last_run.json（各平台签到历史） travel_state.json
 │
@@ -103,7 +119,7 @@ workbuddy-signin/
 
 | 文件 | 作用 |
 |------|------|
-| `web_server.py` | 手机网页版服务：11 个平台签到适配器 + 单页 UI（含统一「可用积分」显示、即梦过期提示、华为网页登录、Link AI / OiiOii 手动确认）；`--daily` 模式供服务器定时跑全部平台 |
+| `web_server.py` | 手机网页版服务：11 个平台签到适配器 + 单页 UI（含统一「可用积分」显示、即梦过期提示、华为网页登录、Link AI 手动确认）；`--daily` 模式供服务器定时跑全部平台 |
 | `wb_icon.py` | 各平台官方图标（64×64 圆角内联 SVG/PNG，含 Coze 官方 logo 已 base64 内联） |
 | `wb_travel.py` | 派猫猫旅行（WorkBuddy 卡内弹窗）逻辑，共用 WorkBuddy 登录态 |
 | `wb_growth.py` | WorkBuddy 成长中心 / 每日任务 一键完成（纯标准库） |
@@ -151,7 +167,7 @@ workbuddy-signin/
 
 ### 1. 启动服务（三选一）
 - **本机试用**：双击 `start_web.bat`，窗口打印手机访问地址（需同 WiFi + 防火墙允许）。
-- **服务器 systemd**（已部署示例）：`web_server.py` 监听 `127.0.0.1:8790`，由 nginx `location /checkin/` 反代；`wb-checkin-daily.timer` 每天 08:35 自动签到。
+- **服务器 systemd**（已部署示例）：`web_server.py` 监听 `127.0.0.1:8790`，由 nginx `location /checkin/` 反代；**进程内自带调度线程**，每天按 `settings.json` 的 `schedule_time` 自动签到。
 - **手动前台**：`python web_server.py --daily` 跑一次签到；`python web_server.py` 起网页服务。
 
 ### 2. 配置访问口令（建议）
@@ -174,7 +190,6 @@ workbuddy-signin/
 | **Trae Work** | `trae_cookie.txt` + `trae_device_id.txt` | `TRAE_COOKIE`/`TRAE_JWT` + `TRAE_DEVICE_ID` | Cookie 见 config.example；**设备 id 见第 4 步** |
 | Coze 扣子 | `coze_cookie.txt` | `COZE_COOKIE` | 浏览器登录 coze.cn 后复制全部 Cookie |
 | 即梦 AI | `jimeng_cookie.txt` | `JIMENG_COOKIE` | 浏览器登录 jimeng.jianying.com 后复制全部 Cookie（sessionid 即凭证） |
-| OiiOii AI | `oiioii_token.txt` | `OIICII_TOKEN` | 浏览器登录 oiioii.ai 后，从签到请求的 `Authorization: Bearer` 后复制 JWT（约 7 天有效；想长期可再提供 Supabase `session.json` 做自动续期） |
 | 华为码道 | `hw_cookie.txt` | `HW_COOKIE` | 由本机 `huawei/` 工具链自动同步；亦可在网页「🔑 配置会话 Cookie」粘贴登录态 |
 | **豆包 Doubao** | `doubao_cookie.txt`（本机浏览器导出） | `DOUBAO_COOKIE` | 见下方「第 9 步 · 豆包」（特殊架构，不能直接填 cookie 服务端签） |
 
@@ -280,7 +295,7 @@ curl -s 127.0.0.1:8791/health     # 应返回 {"ok":true,"hasCookie":false}
 > 设置后本机需用新口令访问（页面把口令存 `localStorage['wb_center_key']`，**不放在 URL**）。
 
 ### 3. 🎚 平台开关
-按 `PLATFORM_TITLES` 列出每个平台一个开关（WorkBuddy / 百度千帆 / MiniMax Code / 即梦 AI / Qoder / Link AI / WPS 灵犀 / Trae Work / OiiOii AI / 华为码道）：
+按 `PLATFORM_TITLES` 列出每个平台一个开关（WorkBuddy / 百度千帆 / MiniMax Code / 即梦 AI / Qoder / Link AI / WPS 灵犀 / Trae Work / 华为码道）：
 - 关掉的平台在 `get_center` 标 `disabled`、灰显「已停用」，并在 `run_daily_all` 中跳过；
 - **派猫猫旅行**不在此列——它跟随 WorkBuddy（关 WorkBuddy 即关 travel）。
 
@@ -307,6 +322,62 @@ run_checkin.bat
 ```
 看 `checkin.log` 里的结果即可。
 
+> `run_checkin.bat` 会**先自动刷新会话令牌**再签到（见下节），所以正常情况下你只管双击就行。
+
+### 1.5 WorkBuddy 会话令牌自动刷新（新版客户端已加密本地会话文件）
+
+**问题**：新版 WorkBuddy 把本地会话文件
+`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
+里的 `accessToken` / `refreshToken` 等字段做了**静态加密**，读出来是
+`{"$wbEncrypted":1,"envelope":"..."}`，`workbuddy_checkin.py` 再也拿不到明文。
+以前靠人工维护的 `token.info` 副本不会自动更新 → 令牌一过期签到就断。
+
+**方案**：`wb_token_dump.js` 用 **WorkBuddy 自带的二进制以 Node 模式**运行，
+通过原生模块 `electron_browser_workbuddy_storage.loggerGet()` 取到主密钥，
+把整个会话文件解密成明文。
+
+- 不需要附加调试器、不需要 `--inspect`、不需要管理员权限；
+- 不需要额外依赖（解密用 Node 内置 `crypto`）。
+
+密钥链（已在 `app.asar` 中逆向确认）：
+
+```
+atRestSecretKey (base64, 32B, 来自原生模块 loggerGet())
+  → symmetricKey = sha256(atRestSecretKey)               // 32B
+  → protectorKeyId = sha256(symmetricKey).hex[:16]       // = 9127dea1b44020a7
+  → 字段密文 = AES-256-GCM(symmetricKey, nonce, aad)
+     aad = "WB-AAD\0" | 01 | lenPrefixed("WBEV1") | lenPrefixed("sym-v1")
+           | uint32BE(suite) | lenPrefixed(keyId) | [kind] | [0] | [0]
+```
+
+**手动刷新**（会同时更新本机 `token.info` 并推送到 112）：
+
+```
+run_token_sync.bat                 # 刷新 + 上传
+run_token_sync.bat --no-upload     # 只刷新本机
+```
+
+也可以直接调 Python：
+
+```
+python wb_token_sync.py            # 刷新 + 上传
+python wb_token_sync.py --print    # 附带打印令牌片段，排障用
+```
+
+- 日志：`token_sync.log`（本机运行时也会追加进 `checkin.log`）。
+- 刷新是**原子写**：先写临时文件再替换，解密失败时旧的 `token.info` 保持不动。
+- 上传有**两条通道，前者失败自动降级到后者**：
+  1. **SFTP**（默认）：直连 112 的 22 端口，`scp` 语义，写入 `/opt/wb-checkin/token.info`（`0600`）并回读 `md5sum` 校验；需要 `paramiko`。
+  2. **HTTP 兜底**：POST 整份会话文件到 `https://bjzjsf.asia/checkin/api/wb/upload-token?k=<口令>`，
+     服务端收下后同样**原子落盘**到 `WB_TOKEN_FILE`。服务端会做两道校验——访问口令 + 可选的来源 IP 白名单
+     （`WB_UPLOAD_ALLOW_IPS`，逗号分隔；不设则只校验口令）。**走这条通道不需要 paramiko。**
+- `run_token_sync.bat` / `run_checkin.bat` 会自动挑选带 `paramiko` 的解释器
+  （`D:\Dev\python.exe` 优先，其次 `%USERPROFILE%\.workbuddy-ai\binaries\...`），
+  都没有时走 HTTP 兜底，仍然能推到服务器。
+- 令牌剩余有效期不足 3 天会在日志里告警——打开一次 WorkBuddy 让它自动续期即可。
+- **落盘后不需要重启服务**：`_session()` 每次调用现读盘，没有内存缓存，下一次签到就用新令牌。
+  （对照：豆包的 cookie 因为服务端有内存缓存，才需要热加载 + 重启路径。）
+
 ### 2. 设置每天自动跑（本机，一次设置长期有效）
 以**管理员身份**打开 PowerShell：
 ```powershell
@@ -326,15 +397,15 @@ schtasks /run /tn WorkBuddyDailyCheckin
 
 ### 4. 服务器自动签到 + 手机网页查看（已部署到云服务器 ✅）
 
-**签到已由服务器自动完成**：systemd 定时器 `wb-checkin-daily.timer` 每天 08:35 自动签到（恢复后会补跑），你什么都不用做。网页 `http://<你的服务器IP>/checkin/`（或域名）只是**用来看记录**；按钮是**手动备用**——万一定时没跑成功，点一下即可补签。
+**签到已由服务器自动完成**：`web_server.py` 进程内的调度线程每天按 `settings.json` 的 `schedule_time` 自动签到（恢复后会补跑），你什么都不用做。网页 `http://<你的服务器IP>/checkin/`（或域名）只是**用来看记录**；按钮是**手动备用**——万一定时没跑成功，点一下即可补签。
 
 | 项目 | 值 |
 |------|----|
 | 查看地址 | **http://<你的服务器IP>/checkin/**（或你的域名）|
 | 访问口令 | 由 `.env` 的 `ACCESS_KEY`（或服务器 `WB_ACCESS_KEY` 注入），也可在「⚙ 设置」页改；不写代码、不入库 |
-| 自动签到 | systemd `wb-checkin-daily.timer` → 每天 08:35 触发 `wb-checkin-daily.service`（执行 `web_server.py --daily`，一次跑完平台，任一失败不阻塞其余）|
+| 自动签到 | `web_server.py` **进程内置调度线程**（读 `settings.json` 的 `schedule_time`），一次跑完所有平台，任一失败不阻塞其余 |
 | 网页服务 | systemd `wb-checkin`，监听 `127.0.0.1:8790` |
-| nginx | `location /checkin/` 反代 |
+| nginx | `location /checkin/` 反代；全站已下发安全头，并已阻断 `/.git`、`*.bak` 等敏感路径 |
 | 服务端目录 | `/opt/wb-checkin`（含 web_server.py / wb_icon.py / workbuddy_checkin.py / wb_growth.py / token.info / 各 *_last_run.json / 各平台凭据文件 / settings.json）|
 | 本地部署 | `python deploy_ui.py`（上传代码 + 凭据 + 重启服务，最小化不碰口令）|
 
@@ -342,13 +413,30 @@ schtasks /run /tn WorkBuddyDailyCheckin
 
 服务器运维（SSH 登录 ECS 后执行）：
 ```bash
-systemctl list-timers wb-checkin-daily.timer    # 看下次自动签到时间
-systemctl status wb-checkin                     # 网页服务状态
-journalctl -u wb-checkin-daily.service -n 30    # 看自动签到日志
-systemctl start wb-checkin-daily.service        # 手动立刻跑一次（不影响定时）
+systemctl status wb-checkin                     # 网页服务状态（内置调度线程随它启动）
+journalctl -u wb-checkin -n 30                  # 看运行 / 自动签到日志
 systemctl restart wb-checkin                    # 重启网页服务
-python3 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台看结果）
+python3.11 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台看结果）
+nginx -t && systemctl reload nginx              # 改完 nginx 配置后校验 + 热加载
 ```
+> 服务器上 `python3` 是 3.6.8，跑不动本项目的 f-string/语法，**必须用 `python3.11`**。
+
+### 服务器安全加固（2026-10-14 审计）
+
+nginx 侧现状与已做加固，记录备查：
+
+| 项目 | 状态 |
+|------|------|
+| 访问日志 | ✅ `/var/log/nginx/access.log`（`main` 格式，含 IP / UA / X-Forwarded-For），logrotate 每日轮转、保留 10 天、gzip 压缩 |
+| 安全头 | ✅ 全站下发 `X-Content-Type-Options: nosniff`、`X-Frame-Options: SAMEORIGIN`、`Referrer-Policy: strict-origin-when-cross-origin`；443 段另有 `Strict-Transport-Security` |
+| 敏感路径阻断 | ✅ `/.git`、`/.github`、`/.svn`、`/.hg`、`/.bzr`、`/.env`、`/.DS_Store`，以及 `*.bak`、`*.old`、`*.orig`、`*.swp`、`*.save` 一律返回 404 |
+| 限流 | ❌ 未做。nginx 未编译 `limit_req` / `limit_conn` 模块，且约 97% 流量来自本页自身轮询，故计划改为应用层限流（待办） |
+
+**`Referrer-Policy` 为什么用 `strict-origin-when-cross-origin` 而不是 `no-referrer`**：跨站请求只发 origin（不含路径和查询串），已足够阻止 `?k=` 访问口令随 Referer 外泄，同时不破坏同源跳转，兼容性最好。
+
+**`add_header` 的继承坑**：子级 `location` 只要写了任意一条 `add_header`，父级 / server 级的**全部** `add_header` 立即失效。因此 `location /` 和 `location /mywork/` 里各重复了一遍安全头。
+
+**配置文件与回滚**：`/etc/nginx/conf.d/ip_direct.conf`（同一文件内承载 80 与 443 两个 server 块）。改动前已备份为 `ip_direct.conf.bak.security-<时间戳>`，回滚只需 `cp -a` 覆盖回去再 `nginx -t && systemctl reload nginx`。
 
 ---
 
@@ -378,8 +466,27 @@ python3 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台
 - **华为卡显示「登录态过期」**：本机双击 `huawei/relogin_huawei.bat` 重新登录一次；之后 `hw_keeper.js` + `hw_autopush.py` 会自动维持并推送（本机需常驻运行）。
 - **华为卡想从网页直接登录**：卡片 / 详情页点「🔑 配置会话 Cookie」，从浏览器 DevTools 复制登录后的华为 Cookie 粘贴保存即可（因 `J_SESSION_ID` 是 HttpOnly，JS 读不到，无法做「输账号密码自动登录」；粘贴方案是最诚实可行的网页登录方式）。保存后寿命仍仅 30~60 分，够当下立即签到一次。
 - **即梦卡显示「Cookie 可能已失效」**：字节风控强，`jimeng_cookie.txt` 会周期失效。重捕 Cookie 后重部署即可——经 `deploy_ui.py` 上传新 `jimeng_cookie.txt`（覆盖线上）后重启服务，`get_jimeng_card()` 即恢复。
-- **Link AI 卡一直显示「需手动」，重新检查也没变已签**：这是预期的——Link AI 接口强制图片验证码，服务端代签不了，也无从得知你浏览器里的签到。请先在网页 `console.link-ai.tech` 手动签到，再回到卡片点「✅ 我已在网页签到」确认，卡片即标记「今日已签」（本地记录，每天重置，诚实不谎报）。
-- **OiiOii 卡一直显示「需网页手动签到」**：与 Link AI 同理——OiiOii 的领取接口（`/points/add`）强制腾讯云人机验证（`CAPTCHA_REQUIRED`），服务端无解验证码能力、无法自动代签。请先到 `oiioii.ai` 网页完成每日签到（过人机验证那一步），再回到卡片点「✅ 我已在网页签到」确认即可。卡片上的「可用积分」是真实查询值，状态如实显示。JWT 约 7 天失效后，重新从浏览器复制 `Authorization: Bearer` 后的那段更新 `oiioii_token.txt` 即可。
+- **Link AI 卡显示「登录态过期」**：`linkai_token.txt` 的 JWT 失效。登录 `link-ai.tech/console/account` 复制新的 API Token 覆盖该文件，经 `deploy_ui.py` 推到 112 后**重启服务**即可（该文件历史上是启动时读一次，现已改为现读盘，但仍建议重启一次确保干净）。
+- **Link AI 的图片验证码怎么解决的**：已用纯代码自动绕过，**不再需要手动签到**。原理：
+  - Link AI 用的是开源 **AJ-Captcha** 的 `blockPuzzle`（滑块）模式；签到按钮点击链是 `ja()` → `za("blockPuzzle")` → 拿 `captchaVerification` 提交。
+  - 两个关键利用点：① `/api/captcha/get` 与 `/api/captcha/check` **完全无鉴权**，不需要 Authorization；② 服务端把【完整原图】和【缺口小块】一起下发，小块带 alpha 通道，是原图上抠出来的 → 可用「alpha 掩膜 + 逐列像素差」精确反推缺口的真实 x 坐标。
+  - 签名是硬编码密钥的 AES：`captchaVerification = AES_ECB_PKCS7(secretKey, token + '---' + '{"x":距离,"y":5}')`，前端密钥 `XwKsGlMcdPMEhR1B`。
+  - 背景图上那三个白色拼图轮廓是**干扰项**，模板匹配的最优解与次优解差异呈断层（如 22.96 vs 39.50），可视化确认精确命中真缺口。
+  - 实现见 `lk_captcha_solver.py`，`solve_captcha()` 一把返回 `captchaVerification`。本机与 112 服务器各跑 5 轮，成功率 **10/10**。
+  - 该模块依赖 `pillow` / `numpy` / `pycryptodome`（112 上已装好）。
+
+- **⚠️ Link AI 的三个返回码，别搞混**（这是本项目最容易误判的地方）：
+
+  | 码 | 含义 | 是否表示「今天签过」 |
+  |----|------|------------------|
+  | `200` + `data.score` | 本次签到成功，拿到积分 | 是 |
+  | `870` 签到失败 | **服务端要求滑块验证码** | **否——这个码是恒定的** |
+  | `834` 今日已签到，请明日再来 | 重复签到被拒 | 是 |
+
+  特别强调 **`870` 不含「今天是否已签」的信息**：不论今天签没签过，只要请求里没带 `captchaVerification`，它都返回 870。
+  所以**不能靠它判断签到状态**。卡片里「今天签没签」是靠 `_lk_signed_today()` 回看
+  `lk_last_run.json` 中当日 `ok == true` 的记录来判定的。
+  只有**带上验证码**提交时，服务端才会区分出 `200`（本次成功）和 `834`（重复签到）。
 - **设置改了不生效**：口令/通知即时生效；定时时间在保存时已热更新。若仍不对，确认 `settings.json` 已写入（被 gitignored，不会进仓库）。
 - **豆包卡显示「需本机签名」/ 点「完成任务」没反应**：豆包写接口强制 `a_bogus` 浏览器实时签名，必须本机（或 112）有签名代理在跑。本机方案：确认 `doubao_signer.bat` 已启动且 `schtasks /query /tn DoubaoSignService` 状态 `Ready`；服务器方案（方案二）：确认 `systemctl status wb-doubao-sign` 为 active 且 `curl 127.0.0.1:8791/health` 的 `hasCookie` 为 true（未推登录态会签不了）。
 - **豆包「一键完成任务」领不到积分**：豆包「积分任务」需您**在豆包真做完**（如真生成一次 PPT、真用某个技能），平台校验真实使用；未完成的任务弹窗会标「⏳ 待完成」，自动化无法替您做，也不伪造领取。
@@ -422,14 +529,20 @@ python3 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台
 - **幂等**：当日已领返回 `is_first_receive:false`、不再加积分 → 每日定时跑安全不重复。
 - 卡片底部统一显示「可用积分」，并额外展示「88 积分将于 x月x日 过期」（取自 `expiring_credits[].expire_time`）。字节风控强，`jimeng_cookie.txt` 会周期失效，届时卡片诚实标「Cookie 可能已失效」，需重捕经 `deploy_ui.py` 部署。
 
-**华为码道 DevCloud**（对应 `get_hw_card` / `run_hw_checkin`，手动卡）：
+**华为码道 DevCloud**（对应 `get_hw_card` / `run_hw_checkin`，**自动卡**）：
 - 端点前缀 `https://devcloud.cn-north-4.huaweicloud.com/chat/PromptCenterService/v1/ops/`，每日签到需带浏览器同款头（`cftk` CSRF）否则回 SPA HTML。
-- 会话寿命短（静置 30~60 分失效）→ 每天 08:35 自动签必失败；真解：本机 `hw_keeper.js` 无头常驻每 5 分刷新 + `hw_autopush.py` 推 112。本机没开机/守护停了 → 华为卡转「登录态过期」→ 双击 `huawei/relogin_huawei.bat` 恢复。
+- **签到本身是全自动的**：服务器按 `schedule_time` 每天自动 claim + confirm，`hw_last_run.json` 显示长期每天 `ok:true`「+1000 积分」。
+- 唯一的维护点是**会话 Cookie 短效**（静置 30~60 分失效）：本机 `hw_keeper.js` 无头常驻每 5 分刷新 + `hw_autopush.py` 推 112，维持服务器那份会话可用。本机没开机/守护停了 → 华为卡转「登录态过期」→ 双击 `huawei/relogin_huawei.bat` 恢复。
 - **网页直接登录**：因 `devclouddevuibjJ_SESSION_ID` 是 HttpOnly（JS 读不到），无法做「输账号密码自动登录」。卡片 / 详情页提供「🔑 配置会话 Cookie」按钮（`openHwLogin()` 弹窗），从浏览器 DevTools 复制登录后的 Cookie 粘贴保存即可——后端 `set_hw_cookie()` 写入 `hw_cookie.txt`（已 gitignored）并实测验证可用性，立即可「立即签到」。寿命仍仅 30~60 分，够当下签到一次；每日自动定时仍靠本机守护。
 
 **千帆 / Link AI / WPS 灵犀 / Trae**：均为标准 token 或 Cookie 串鉴权，凭据见 `config.example.json`，过期后重新导出并经 `deploy_ui.py` 部署。
 
-其中 **Link AI**（对应 `get_lk_card`，手动卡）：签到接口 `/sign/in` 现强制要求图片验证码（返回 `code=870`），服务端无解验证码能力，故**无法自动代签**；卡片标「需手动」，并在网页手动签到后提供「✅ 我已在网页签到」按钮（`set_lk_manual_signed()` 本地记录今日已签，每天自动重置，诚实不谎报）。
+其中 **Link AI**（对应 `get_lk_card`，**自动卡**）：签到接口 `/sign/in` 要求滑块验证码
+（未带验证码时返回 `code=870`），现已由 `lk_captcha_solver.py` **自动破解**，
+签到全自动完成。该模块的完整原理与三个返回码的区分见上方 FAQ
+「Link AI 的图片验证码怎么解决的」。
+（历史：曾标「需手动」并提供「✅ 我已在网页签到」按钮，
+`set_lk_manual_signed()` 保留作向后兼容，老记录仍能正确显示已签。）
 
 其中 **Trae Work**（对应 `get_trae_card` / `run_trae_checkin`）：
 - 签到：`POST https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim`（`req_source=2`，客户端通道）
@@ -437,13 +550,6 @@ python3 /opt/wb-checkin/web_server.py --daily   # 手动跑一次签到（前台
 - `code=9004`（参数/通道不符）→ 此前臆加的 `x-device-model/-system/-client-version` 三个头服务端不认，现已移除、仅保留客户端真实使用的 `x-device-id`。
 - `code=9074`（当前参与用户太多）→ **真因是伪设备 id，不是限流、也不是令牌体系问题**。服务端按「设备」记账：用随机伪设备 id（`wb-xxxx`）会被直接拒；必须用**你自己的 Trae 客户端真实设备 id**（`env TRAE_DEVICE_ID` 或 `trae_device_id.txt`）。实测真实设备 id + cookie 换发的 JWT + `req_source=2` 即 `code=0 success`（`did_checked_in:true`），**无需导出桌面 userInfo.token**。
 - **⚠️ Trae 设备 id 必配**：从你自己的 `TRAE SOLO CN` 客户端取真实设备 id（见下方「开源首次配置指南 · 第 4 步」），写入 `trae_device_id.txt` 或环境变量 `TRAE_DEVICE_ID`。留空会导致 9074、无法自动签。
-
-**OiiOii AI**（对应 `get_oiioii_card` / `run_oiioii_checkin`，手动卡）：
-- 鉴权：`Authorization: Bearer <Supabase 用户 JWT>`（账户体系跑在 supabase 项目 `ugvuzestypbmcfurrbd` 上，iss `https://ugvuzestypbmcfurrbd.supabase.co/auth/v1`；anon key 公开、非私密）。
-- 状态查询：`POST https://api.oiioii.tv/points/buckets/query` → `data.buckets[]`；其中 `type=="sign_in"` 且 `created_at` 日期==今天 ⇒ 今日已签；可用积分 = Σ `available_amount`。
-- 签到领取：`POST https://api.oiioii.tv/points/add` body `{"type":"sign_in"}` —— **该接口强制要求腾讯云人机验证，返回 `CAPTCHA_REQUIRED`，服务端无解验证码能力，无法自动代签**。
-- **⚠️ 诚实模式（与 Link AI 同思路）**：卡片展示真实签到状态 + 可用积分，并提供「🌐 去官网签到」跳转与「✅ 我已在网页签到」本地确认按钮（`set_oiioii_manual_signed()` 写本地记录，每天重置，绝不谎报已签）；`run_oiioii_checkin()` 命中 `CAPTCHA_REQUIRED` 时**诚实返回未签状态、不伪造成功**。OiiOii 因此**不在 `AUTO_PLATFORMS` 自动签到列表**（每日定时不会去撞验证码），仅作手动卡呈现。
-- 凭据：`oiioii_token.txt`（JWT，约 7 天有效；环境变量 `OIICII_TOKEN` 优先）。想长期免重配，可把浏览器里的 Supabase `session.json`（含 `access_token`+`refresh_token`）放到 `oiioii_session.json`，适配器会在到期前自动用 `refresh_token` 续期（均 gitignored，等同账号密码，禁入库）。
 
 **豆包 Doubao**（对应 `get_doubao_card` / `run_doubao_checkin` + 本机 `doubao_sign.js` / 服务器 `doubao_sign_server.js`）：
 - **死结**：写接口（签到 `checkin`、领奖 `alice/ug/campaign/item/reward/claim`）强制 `a_bogus` 动态签名，由豆包网页 JS 在真实浏览器发请求时现场哈希（参数+时间戳+浏览器指纹），函数锁死在闭包，服务器无法复现；仅持 cookie 裸调 → `710010702` 拒绝。
