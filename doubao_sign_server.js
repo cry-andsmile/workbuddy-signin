@@ -45,21 +45,35 @@ let _browserPromise = null;
 let _signing = false;
 
 async function getBrowser() {
-  if (!_browserPromise) {
-    _browserPromise = chromium.launch({
-      headless: true,
-      // 服务器通常以 root 运行，必须关沙箱；容器里还要用 /dev/shm 的替代。
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-blink-features=AutomationControlled',
-      ],
-    });
+  if (_browserPromise) {
+    try {
+      const b = await _browserPromise;
+      if (b.isConnected()) return b;
+      dlog('[browser] 浏览器已断开，重建');
+    } catch (e) {
+      dlog('[browser] 复用的浏览器已失效，重建: ' + String(e).slice(0, 160));
+    }
+    try { const old = await _browserPromise; await old.close(); } catch (_) {}
+    _browserPromise = null;
   }
-  return _browserPromise;
+  const p = chromium.launch({
+    headless: true,
+    // 服务器通常以 root 运行，必须关沙箱；容器里还要用 /dev/shm 的替代。
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+  _browserPromise = p;
+  // 【关键】启动失败必须清空缓存，否则一次瞬态失败会把服务永久锁死（旧版即此 bug：
+  // 无头 chromium 崩溃/被 OOM 杀掉后，_browserPromise 永远是 rejected promise，之后每次都直接抛
+  // "Target page, context or browser has been closed"，而 systemd 只看到进程还活着 → 永不重启）。
+  p.catch(() => { if (_browserPromise === p) _browserPromise = null; });
+  return p;
 }
 
 function loadServerCookies() {
@@ -119,6 +133,8 @@ async function doSign() {
       return out;
     }, { SCENE, QP });
     await o.page.close();
+    // 只有签到接口真返回 code=0 才标记「今日已签」，避免失败被误记导致保活不再重试
+    if (result && result.checkin && result.checkin.code === 0) markSignedToday();
     return { ok: true, result };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -334,12 +350,30 @@ async function ensureSignedToday() {
   dlog('[doubao-sign-server] 保活补签：今日尚未签到，尝试...');
   try {
     const r = await doSign();
-    if (r && r.ok) markSignedToday();
+    // 以签到接口真实返回为准（doSign 内部已标记，这里再兜底一次），失败则下次保活继续重试
+    const chk = r && r.result && r.result.checkin;
+    if (r && r.ok && chk && chk.code === 0) markSignedToday();
     dlog('[doubao-sign-server] 保活补签结果: ' + JSON.stringify(r && r.result ? r.result : r).slice(0, 200));
   } catch (e) { dlog('[doubao-sign-server] 保活补签出错: ' + e); }
 }
 setTimeout(() => ensureSignedToday(), 15000);
 setInterval(() => ensureSignedToday(), 20 * 60 * 1000);
+
+// ---- 浏览器健康看门狗：定期探活，发现无头 chromium 已死就清缓存，下一次调用自动重建 ----
+// 覆盖「chromium 崩溃/被 OOM 杀掉、但 node 进程还活着」——旧版正是这种场景下永久瘫痪。
+setInterval(async () => {
+  if (_signing || !_browserPromise) return;
+  try {
+    const b = await _browserPromise;
+    if (!b.isConnected()) {
+      dlog('[watchdog] 浏览器已断开，重置缓存待重建');
+      _browserPromise = null;
+    }
+  } catch (e) {
+    dlog('[watchdog] 浏览器探活失败，重置缓存待重建: ' + String(e).slice(0, 140));
+    _browserPromise = null;
+  }
+}, 3 * 60 * 1000);
 
 process.on('SIGINT', async () => {
   console.log('[doubao-sign-server] 正在关闭 ...');

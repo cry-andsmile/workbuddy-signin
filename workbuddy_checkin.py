@@ -9,6 +9,10 @@ WorkBuddy 每日积分签到（纯代码层，无需打开应用、无需点击�
 - token 由 WorkBuddy 自身维护（你日常打开 WorkBuddy 时会自动刷新），脚本只读取，不修改。
 - 为避免影响你主程序的登录态，脚本不会用 refreshToken 去刷新/轮转 token；
   若 accessToken 过期（例如很久没开 WorkBuddy），会提示你先打开一次 WorkBuddy。
+- 新版 WorkBuddy 已把本地会话文件加密（accessToken 变成 {"$wbEncrypted":...}），
+  所以本脚本读的是同目录的明文副本 token.info；该副本由 wb_token_sync.py 自动刷新
+  （解密走 wb_token_dump.js + WorkBuddy 自带二进制，无需调试器/管理员权限），
+  run_checkin.bat 每次签到前都会先跑一遍，服务器侧的 token.info 也由它推送。
 """
 import json
 import os
@@ -29,6 +33,20 @@ try:
 except Exception:
     pass
 
+def _token_is_plaintext(path):
+    """会话文件里的 accessToken 是否为明文 JWT 字符串。
+
+    新版 WorkBuddy 客户端已把本地会话文件加密（accessToken 变成
+    {"$wbEncrypted":..,"envelope":..} 对象），此时无法直接读取，需回退到明文副本。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return isinstance((d.get("auth") or {}).get("accessToken"), str)
+    except Exception:
+        return False
+
+
 # 会话文件位置（明文存放 accessToken / uid / domain）
 def find_token_file():
     # 1) 环境变量显式指定（部署到服务器时用：WB_TOKEN_FILE=/opt/wb-checkin/token.info）
@@ -41,10 +59,19 @@ def find_token_file():
     if local:
         candidates.append(os.path.join(local, "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"))
     candidates.append(r"C:\Users\54004\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info")
+    # 3) 兜底：脚本同目录的明文 token.info（新版客户端把本地会话文件加密后，
+    #    这里维护的明文副本仍可直接使用；由人工/部署流程更新）
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.info"))
+    # 优先返回「accessToken 是明文」的那个；若全部被加密，再退回第一个存在的（交给上层报明确错误）
+    fallback = None
     for c in candidates:
-        if os.path.isfile(c):
+        if not os.path.isfile(c):
+            continue
+        if _token_is_plaintext(c):
             return c
-    return None
+        if fallback is None:
+            fallback = c
+    return fallback
 
 def b64url_decode(s):
     s += "=" * (-len(s) % 4)
@@ -62,8 +89,16 @@ def load_session(path):
     with open(path, "r", encoding="utf-8") as f:
         d = json.load(f)
     auth = d.get("auth", {})
+    tok = auth.get("accessToken")
+    if not isinstance(tok, str):
+        # 新版 WorkBuddy 把本地会话文件加密了；给出明确指引而不是让它变成诡异的 401
+        raise ValueError(
+            "会话文件里的 accessToken 不是明文（新版 WorkBuddy 已加密该文件）。"
+            "请先跑一次 run_token_sync.bat 生成明文 token.info"
+            "（或用环境变量 WB_TOKEN_FILE 指定其路径）。"
+        )
     return {
-        "access_token": auth.get("accessToken"),
+        "access_token": tok,
         "uid": d.get("account", {}).get("uid"),
         "domain": auth.get("domain") or "copilot.tencent.com",
         "token_type": auth.get("tokenType") or "Bearer",
@@ -167,6 +202,28 @@ def snapshot_balance(sess):
         pass
 
 
+def _pre_checkin_chat(sess):
+    """签到前置：WorkBuddy 官方要求「当天存在一次对话记录」才会记录签到
+    （否则 daily-checkin 不生效 → 签到空白 / 连登断开）。
+
+    先补发一条极简对话满足该条件。尽力而为：wb_growth 缺失或对话失败都不阻断签到。
+    返回 (status, err)：status 为对话 HTTP 状态码，失败为 None。
+    """
+    try:
+        import sys as _sys
+        _d = os.path.dirname(os.path.abspath(__file__))
+        if _d not in _sys.path:
+            _sys.path.insert(0, _d)
+        import wb_growth
+    except Exception as e:
+        return None, "wb_growth 未加载: %s" % e
+    try:
+        st, _ = wb_growth.chat_completion(sess, "deepseek-v4-flash", "你好")
+        return st, None
+    except Exception as e:
+        return None, str(e)
+
+
 def main():
     log = []
     def p(*a):
@@ -236,6 +293,15 @@ def main():
         p("[结果] 今天已经签到过了，无需重复操作。✅")
         write_state(True, "今天已经签到过了", data)
         return 0
+
+    # 1.5) 签到前置：官方要求「当天有一次对话记录」才记录签到，先补一条极简对话
+    #      （与 112 web_server.py 的 _pre_checkin_chat 行为保持一致）
+    p("[动作] 签到前置：补发一条对话（满足官方「当天有对话」要求）...")
+    _cst, _cerr = _pre_checkin_chat(sess)
+    if _cst:
+        p(f"[前置] 对话完成 HTTP {_cst}")
+    else:
+        p(f"[前置] 对话未完成（不阻断签到）: {_cerr}")
 
     # 2) 签到
     p("[动作] 执行签到 daily-checkin ...")

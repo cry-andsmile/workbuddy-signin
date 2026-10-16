@@ -61,7 +61,6 @@ try:
         HW_SVG,
         QD_SVG,
         JIMENG_SVG,
-        OIICII_SVG,
     )
 except Exception:
     CENTER_SVG = ""
@@ -74,7 +73,6 @@ except Exception:
     HW_SVG = ""
     QD_SVG = ""
     JIMENG_SVG = ""
-    OIICII_SVG = ""
 
 # WorkBuddy 成长中心图标（紫色渐变火箭，对应成长中心品牌色 #7C5CFF）
 GROWTH_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="grGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7C5CFF"/><stop offset="1" stop-color="#9D7BFF"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#grGrad)"/><path d="M32 10c6 5 7 14 4 23l-4 7h0l-4-7c-3-9-2-18 4-23z" fill="#fff"/><circle cx="32" cy="24" r="4.5" fill="#7C5CFF"/><path d="M24 33l-6 9 7-4z" fill="#fff"/><path d="M40 33l6 9-7-4z" fill="#fff"/><path d="M29 40l3 12 3-12z" fill="#FFE255"/><circle cx="47" cy="18" r="2.6" fill="#fff"/><circle cx="17" cy="21" r="1.8" fill="#fff"/><circle cx="44" cy="40" r="1.6" fill="#fff"/></svg>"""
@@ -808,6 +806,8 @@ def get_mm_card():
             "checked": p["claimed_today"],
             "metric_label": "本轮已签",
             "metric_value": "%s / 7 天" % p["claimed_count"],
+            # 概览条用：今日奖励积分（未领取时为 None，不虚报）
+            "today_credit": (today.get("points") if p["claimed_today"] else None),
             "last_run": lr,
             "rows": rows,
             "error": None,
@@ -860,22 +860,38 @@ def run_mm_checkin():
 #             req_source 改 2 + 补齐客户端设备头后，9004 应消失（仍非 0 则需进一步抓包对齐签名）。
 # 凭据优先级：环境变量 TRAE_COOKIE > 同目录 trae_cookie.txt（HttpOnly+cookie 串，约 14 天）
 #            -> 每日先 GetUserToken 换新 JWT；无 cookie 时降级用 TRAE_JWT / trae_jwt.txt（8h 短期）
-TRAE_COOKIE = os.environ.get("TRAE_COOKIE", "")
-if not TRAE_COOKIE:
+#
+# 注意：早期这里在模块加载时把 cookie 读进 TRAE_COOKIE 后就**再也不刷新**，
+# 导致重新导出 trae_cookie.txt 后用新 cookie 仍报 401（进程里还是旧副本），
+# 必须 systemctl restart 才生效——2026-10-16 实际踩过这个坑。
+# 现改为「每次用之前现读盘」（_trae_cookie()，无缓存），换 cookie 后**无需重启**。
+# 与豆包 cookie 不同（那边确实有缓存，需热重载）。
+TRAE_COOKIE_FILE = os.path.join(BASE_DIR, "trae_cookie.txt")
+TRAE_JWT_FILE = os.path.join(BASE_DIR, "trae_jwt.txt")
+
+
+def _trae_cookie():
+    """返回当前有效的 Trae cookie 串（环境变量优先，其次现读 trae_cookie.txt）。"""
+    env = os.environ.get("TRAE_COOKIE", "")
+    if env:
+        return env
     try:
-        with open(
-            os.path.join(BASE_DIR, "trae_cookie.txt"), "r", encoding="utf-8"
-        ) as _f:
-            TRAE_COOKIE = _f.read().strip()
+        with open(TRAE_COOKIE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
     except Exception:
-        TRAE_COOKIE = ""
-TRAE_JWT = os.environ.get("TRAE_JWT", "")
-if not TRAE_JWT:
+        return ""
+
+
+def _trae_jwt_static():
+    """返回静态 JWT（环境变量优先，其次现读 trae_jwt.txt）。"""
+    env = os.environ.get("TRAE_JWT", "")
+    if env:
+        return env
     try:
-        with open(os.path.join(BASE_DIR, "trae_jwt.txt"), "r", encoding="utf-8") as _f:
-            TRAE_JWT = _f.read().strip()
+        with open(TRAE_JWT_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
     except Exception:
-        TRAE_JWT = ""
+        return ""
 TRAE_STATE_FILE = os.path.join(BASE_DIR, "trae_last_run.json")
 TRAE_API = "https://api.trae.cn/trae/api/v2/ug/checkin_credits"
 TRAE_UG_BASE = "https://api.trae.cn/trae/api/v2/ug"
@@ -908,28 +924,57 @@ def _trae_device_id():
     return ""
 
 
+# 记录最近一次「cookie 换 JWT」的失败原因，供卡片展示（不抛异常给调用方）。
+# 401/20113 = 登录会话过期；设为模块级而非函数内，让 get_trae_card 能读到。
+_TRAE_TOKEN_ERROR = None
+
+
 def _trae_get_token():
-    """优先用 cookie 换发新 JWT（约 8h 有效）；无 cookie 时返回配置的静态 JWT。"""
-    if TRAE_COOKIE:
+    """优先用 cookie 换发新 JWT（约 8h 有效）；无 cookie 时返回配置的静态 JWT。
+
+    重要：本函数**不抛异常**，失败时返回空串并把原因写进 _TRAE_TOKEN_ERROR。
+    历史上它在 401 时直接抛 HTTPError，导致调用方 `if _trae_cookie() and not
+    _trae_get_token()` 这句条件里的异常被外层 except 吞掉，精心准备的
+    「Cookie 已过期」分支永远走不到，用户只能看到裸的 "HTTP Error 401"。
+    """
+    global _TRAE_TOKEN_ERROR
+    cookie = _trae_cookie()
+    if cookie:
         req = urllib.request.Request(
             TRAE_TOKEN_API,
             data=b"",
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Cookie": TRAE_COOKIE,
+                "Cookie": cookie,
                 "Origin": "https://work.trae.cn",
                 "Referer": "https://work.trae.cn/",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             },
         )
-        with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as r:
-            j = json.loads(r.read().decode("utf-8", "replace"))
-        tok = (j.get("Result") or {}).get("Token") or ""
-        if tok:
-            return tok
-    if TRAE_JWT:
-        return TRAE_JWT
+        try:
+            with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as r:
+                j = json.loads(r.read().decode("utf-8", "replace"))
+            tok = (j.get("Result") or {}).get("Token") or ""
+            if tok:
+                _TRAE_TOKEN_ERROR = None
+                return tok
+            _TRAE_TOKEN_ERROR = "响应里没有 Token 字段"
+        except urllib.error.HTTPError as e:
+            # 401 + 20113「Session 过期」= cookie 作废，需重新登录导出
+            detail = ""
+            try:
+                _b = json.loads(e.read().decode("utf-8", "replace"))
+                detail = ((_b.get("ResponseMetadata") or {}).get("Error") or {}).get("Message") or ""
+            except Exception:
+                pass
+            _TRAE_TOKEN_ERROR = "HTTP %s %s" % (e.code, detail or e.reason)
+        except Exception as e:
+            _TRAE_TOKEN_ERROR = "%s: %s" % (type(e).__name__, e)
+    static_jwt = _trae_jwt_static()
+    if static_jwt:
+        _TRAE_TOKEN_ERROR = None
+        return static_jwt
     return ""
 
 
@@ -994,7 +1039,7 @@ _TRAE_CLAIM_LOCK = threading.Lock()
 
 
 def get_trae_card():
-    if not (TRAE_COOKIE or TRAE_JWT):
+    if not (_trae_cookie() or _trae_jwt_static()):
         return {
             "name": "trae",
             "title": "Trae Work 每日签到",
@@ -1011,9 +1056,11 @@ def get_trae_card():
             "error": None,
         }
     # 主动探测 cookie 是否仍有效；有 cookie 却换不出 token = 已过期
+    # _trae_get_token() 现在不再抛异常（见其 docstring），失败原因在 _TRAE_TOKEN_ERROR。
     try:
-        if TRAE_COOKIE and not _trae_get_token():
+        if _trae_cookie() and not _trae_get_token():
             lr = _trae_read_last()
+            why = _TRAE_TOKEN_ERROR or "登录会话已失效"
             return {
                 "name": "trae",
                 "title": "Trae Work 每日签到",
@@ -1022,18 +1069,24 @@ def get_trae_card():
                 "icon": "trae",
                 "checked": False,
                 "needs_auth": True,
+                "badge": "登录态过期",
+                "hide_auth_link": True,
                 "auth_url": "https://work.trae.cn/?mode=mtc",
-                "metric_label": "状态",
-                "metric_value": "Cookie 已过期",
+                "metric_label": "今日状态",
+                "metric_value": "需更新凭据",
                 "last_run": lr,
                 "rows": [
+                    {"k": "原因", "v": "登录 Cookie 已失效（%s）" % why},
                     {
-                        "k": "说明",
-                        "v": "登录 cookie 已失效，请重新在浏览器登录 work.trae.cn 后导出 trae_cookie.txt",
+                        "k": "恢复步骤",
+                        "v": "① 本目录执行 node trae_capture.js；② 弹出窗口里登录 "
+                             "work.trae.cn；③ 登录成功后 cookie 自动写入 trae_cookie.txt；"
+                             "④ 执行 python deploy_ui.py 推到 112；⑤ 回来点「重新检查」",
                     },
                     {
                         "k": "上次执行",
-                        "v": ("%s ⚠️" % str(lr.get("ts"))[5:16]) if lr else "无记录",
+                        "v": ("%s %s" % (str(lr.get("ts"))[5:16],
+                                          "✅" if lr.get("ok") else "⚠️")) if lr else "无记录",
                     },
                 ],
                 "error": None,
@@ -1137,7 +1190,7 @@ def run_trae_checkin():
             "未配置 Trae 设备 id：请在 trae_device_id.txt 或环境变量 TRAE_DEVICE_ID "
             "填入你 Trae 客户端的真实设备 id（见 README「Trae 设备 id 获取」）"
         )
-    if not (TRAE_COOKIE or TRAE_JWT):
+    if not (_trae_cookie() or _trae_jwt_static()):
         raise RuntimeError(
             "未配置 Trae 凭据（trae_cookie.txt / TRAE_JWT 或 trae_jwt.txt）"
         )
@@ -1156,12 +1209,11 @@ def _run_trae_checkin_locked():
     # 前置校验：cookie 失效时尽早给出明确告警，避免静默误判
     tok = _trae_get_token()
     if not tok:
-        _trae_record(
-            False,
-            "登录 cookie 已过期，请重新在浏览器登录 work.trae.cn 后导出 trae_cookie.txt",
-        )
+        why = _TRAE_TOKEN_ERROR or "登录会话已失效"
+        _trae_record(False, "登录 cookie 已过期（%s）" % why)
         raise RuntimeError(
-            "Trae 登录 cookie 已过期，请重新导出 trae_cookie.txt（详见签到中心 Trae 卡片说明）"
+            "Trae 登录 cookie 已过期（%s）——请重新登录 work.trae.cn 导出 "
+            "trae_cookie.txt 后再试（详见签到中心 Trae 卡片说明）" % why
         )
     results = []
     claimed = False
@@ -1357,274 +1409,24 @@ def run_lx_checkin():
 #   鉴权     Authorization: Bearer {token}
 #   无验证码时返回 code:870 message="签到失败"（服务端要求图片验证码），自动签到不可行；870 非"已签"
 # 凭据优先级：环境变量 LINKAI_TOKEN > 同目录 linkai_token.txt
-LINKAI_TOKEN = os.environ.get("LINKAI_TOKEN", "")
-if not LINKAI_TOKEN:
+#
+# 注意：早期在模块加载时读进 LINKAI_TOKEN 后就**再也不刷新**，导致换过
+# linkai_token.txt 后进程里仍是旧 token（401 The JWT has expired），必须
+# systemctl restart 才生效——2026-10-16 与 Trae 同款坑，一并改掉。
+# 现改为「每次用之前现读盘」（_lk_token()，无缓存），换 token 后无需重启。
+LINKAI_TOKEN_FILE = os.path.join(BASE_DIR, "linkai_token.txt")
+
+
+def _lk_token():
+    """返回当前有效的 Link AI token（环境变量优先，其次现读 linkai_token.txt）。"""
+    env = os.environ.get("LINKAI_TOKEN", "")
+    if env:
+        return env
     try:
-        with open(
-            os.path.join(BASE_DIR, "linkai_token.txt"), "r", encoding="utf-8"
-        ) as _f:
-            LINKAI_TOKEN = _f.read().strip()
+        with open(LINKAI_TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
     except Exception:
-        LINKAI_TOKEN = ""
-
-# ============================ OiiOii（oiioii.tv / oiioii.ai）每日签到适配器 ============================
-# 鉴权：Supabase 用户 JWT（Authorization: Bearer {access_token}）；账户体系跑在
-#   supabase 项目 ugvuzestypbmcfurrbd 上，iss=https://ugvuzestypbmcfurrbd.supabase.co/auth/v1
-# 状态查询：POST https://api.oiioii.tv/points/buckets/query
-#           → data.buckets[]；type=="sign_in" 且 created_at 日期==今天 ⇒ 今日已签
-#           → 可用积分 = Σ buckets[].available_amount
-# 签到领取：POST https://api.oiioii.tv/points/add  body {"type":"sign_in"}
-#   ⚠️ 该接口强制要求腾讯云人机验证（CAPTCHA_REQUIRED），服务端无法自动代签；
-#      故走「状态展示 + 去官网一键签到 + 我已在网页签到本地确认」的诚实模式，绝不伪造已签。
-# 凭据优先级：环境变量 OIICII_TOKEN > oiioii_token.txt（静态 access token）
-#   持久化：oiioii_session.json（access_token + refresh_token），到期前自动用 refresh_token 续期
-OIICII_API = "https://api.oiioii.tv"
-OIICII_SUPABASE_URL = "https://ugvuzestypbmcfurrbd.supabase.co"
-# Supabase anon key（公开，role=anon，仅用于 refresh_token 换发），非私密
-OIICII_SUPABASE_ANON = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVndnV6"
-                        "ZXN0eXlwYm1jZnVycmJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEyMTU4NTEsImV4cCI6MjA3Njc5"
-                        "MTg1MX0.Z1qdxtK0PLF5NV1yXrI9s_W2Hurdxo143DBzuUuajh0")
-OIICII_STATE_FILE = os.path.join(BASE_DIR, "oiioii_last_run.json")
-OIICII_SESSION_FILE = os.path.join(BASE_DIR, "oiioii_session.json")
-OIICII_TOKEN = os.environ.get("OIICII_TOKEN", "")
-if not OIICII_TOKEN:
-    try:
-        with open(os.path.join(BASE_DIR, "oiioii_token.txt"), "r", encoding="utf-8") as _f:
-            OIICII_TOKEN = _f.read().strip()
-    except Exception:
-        OIICII_TOKEN = ""
-
-
-def _jwt_exp(token):
-    """从 JWT 的 payload 段取出 exp（秒级时间戳），失败返回 None。"""
-    try:
-        import base64, time
-        seg = token.split(".")[1]
-        seg += "=" * (-len(seg) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(seg))
-        return payload.get("exp")
-    except Exception:
-        return None
-
-
-def _oiioii_refresh(refresh_token):
-    """用 Supabase refresh_token 换发新的 access_token（+ 新 refresh_token）。"""
-    url = OIICII_SUPABASE_URL + "/auth/v1/token?grant_type=refresh_token"
-    headers = {
-        "apikey": OIICII_SUPABASE_ANON,
-        "Authorization": "Bearer " + OIICII_SUPABASE_ANON,
-        "Content-Type": "application/json",
-    }
-    data = json.dumps({"refresh_token": refresh_token, "grant_type": "refresh_token"}).encode()
-    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _oiioii_access_token():
-    """返回可用的 access token：优先 session.json（带 refresh_token 自动续期），兜底 oiioii_token.txt。"""
-    import time
-    try:
-        if os.path.exists(OIICII_SESSION_FILE):
-            with open(OIICII_SESSION_FILE, "r", encoding="utf-8") as f:
-                sess = json.load(f)
-            at = sess.get("access_token")
-            if at and _jwt_exp(at) and _jwt_exp(at) > time.time() + 120:
-                return at
-            rt = sess.get("refresh_token")
-            if rt:
-                try:
-                    new = _oiioii_refresh(rt)
-                    if new.get("access_token"):
-                        sess["access_token"] = new["access_token"]
-                        if new.get("refresh_token"):
-                            sess["refresh_token"] = new["refresh_token"]
-                        with open(OIICII_SESSION_FILE, "w", encoding="utf-8") as f:
-                            json.dump(sess, f)
-                        return new["access_token"]
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return OIICII_TOKEN
-
-
-def _oiioii_api(path, method="GET", body=None, token=None):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    if token:
-        headers["Authorization"] = "Bearer %s" % token
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(OIICII_API + path, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        txt = e.read().decode("utf-8", "replace")
-        try:
-            return json.loads(txt)
-        except Exception:
-            return {"code": "HTTP_%s" % e.code, "error": txt[:200]}
-    except Exception as e:
-        return {"code": "ERR", "error": str(e)}
-
-
-def _oiioii_buckets(token):
-    d = _oiioii_api("/points/buckets/query", "POST", {}, token)
-    if (d or {}).get("code") != "SUCCESS":
-        raise RuntimeError("查询积分桶失败：" + str((d or {}).get("error") or d))
-    return ((d.get("data") or {}).get("buckets") or [])
-
-
-def _oiioii_add(token):
-    return _oiioii_api("/points/add", "POST", {"type": "sign_in"}, token)
-
-
-def _oiioii_record(ok, msg):
-    _append_rec(
-        OIICII_STATE_FILE,
-        {
-            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "ok": ok,
-            "message": msg,
-            "source": "auto",
-        },
-        30,
-    )
-
-
-def _oiioii_manual_signed_today():
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    for rec in _load_json_records(OIICII_STATE_FILE, 30):
-        if isinstance(rec, dict) and rec.get("manual_signed") and rec.get("date") == today:
-            return True
-    return False
-
-
-def set_oiioii_manual_signed():
-    if not _oiioii_access_token():
-        raise RuntimeError("未配置 OiiOii 登录令牌（oiioii_token.txt 或 OIICII_TOKEN）")
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    _append_rec(
-        OIICII_STATE_FILE,
-        {
-            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "ok": True,
-            "manual_signed": True,
-            "date": today,
-            "message": "用户在网页手动签到后确认（服务端无法自动代签）",
-            "source": "manual",
-        },
-        30,
-    )
-    return get_oiioii_card()
-
-
-def get_oiioii_card():
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    token = _oiioii_access_token()
-    if not token:
-        return _auth_fail_card(
-            "oiioii", "OiiOii AI 每日签到", "#FF6B9D", "#8B5CF6", "oiioii",
-            RuntimeError("未配置 OiiOii 登录令牌"),
-            [("如何配置",
-              "把 OiiOii 的登录 JWT（浏览器 F12→Network 里签到请求头 Authorization: Bearer 后那段）"
-              "写入服务器 oiioii_token.txt，或在设置页粘贴；JWT 约 7 天有效，想长期自动可再提供 Supabase session.json 做续期")],
-        )
-    try:
-        buckets = _oiioii_buckets(token)
-        signed_today = any(
-            b.get("type") == "sign_in" and str(b.get("created_at", ""))[:10] == today
-            for b in buckets
-        )
-        total_available = round(sum(float(b.get("available_amount") or 0) for b in buckets), 2)
-        manual = _oiioii_manual_signed_today()
-        checked = bool(signed_today or manual)
-        # 最近的签到桶日期（用于展示）
-        sign_dates = sorted(
-            str(b.get("created_at", ""))[:10]
-            for b in buckets if b.get("type") == "sign_in" and b.get("created_at")
-        )
-        last_sign = sign_dates[-1] if sign_dates else "—"
-        lr = _oiioii_read_last()
-        rows = [
-            {
-                "k": "签到状态",
-                "v": ("✅ 今日已签" if signed_today
-                      else ("✅ 今日已签（网页手动确认）" if manual
-                            else "需网页手动签到（人机验证）")),
-            },
-            {"k": "可用积分", "v": "%s 分" % total_available},
-            {"k": "最近签到", "v": last_sign},
-        ]
-        if manual:
-            rows.append(
-                {
-                    "k": "说明",
-                    "v": "你已在网页完成签到并确认；服务器无法自动代签，此状态为本地记录，每日重置",
-                }
-            )
-        return {
-            "name": "oiioii",
-            "title": "OiiOii AI 每日签到",
-            "brand": "#FF6B9D",
-            "brand2": "#8B5CF6",
-            "icon": "oiioii",
-            "checked": checked,
-            "needs_auth": False,
-            "manual_signed_today": manual,
-            "manual_cta_url": "https://oiioii.ai",
-            "manual_cta_label": "🌐 去官网签到",
-            "badge": (None if checked else "需手动"),
-            "metric_label": "可用积分",
-            "metric_value": total_available,
-            "credit": {"balance": total_available, "unit": "积分", "expiring": None},
-            "last_run": lr,
-            "rows": rows,
-            "error": (None if checked else "需网页手动签到（腾讯人机验证，服务端无法自动代签）"),
-        }
-    except Exception as e:
-        return _auth_fail_card(
-            "oiioii", "OiiOii AI 每日签到", "#FF6B9D", "#8B5CF6", "oiioii", e,
-            [("如何恢复",
-              "OiiOii 登录令牌可能已失效：重新从浏览器复制 Authorization: Bearer 后的 JWT，"
-              "更新服务器上的 oiioii_token.txt 或在设置页粘贴，再点「重新检查」")],
-        )
-
-
-def _oiioii_read_last():
-    try:
-        with open(OIICII_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list) and data:
-            return data[-1]
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return None
-
-
-def run_oiioii_checkin():
-    """OiiOii 签到：best-effort 尝试自动领取，遇人机验证则诚实返回「需网页手动签到」，绝不伪造成功。"""
-    token = _oiioii_access_token()
-    if not token:
-        raise RuntimeError("未配置 OiiOii 登录令牌（oiioii_token.txt 或 OIICII_TOKEN）")
-    r = _oiioii_add(token)
-    code = (r or {}).get("code")
-    if code == "SUCCESS":
-        _oiioii_record(True, "签到成功（接口返回 SUCCESS）")
-    elif code == "CAPTCHA_REQUIRED":
-        _oiioii_record(False, "需完成腾讯人机验证，服务端无法自动代签（请网页手动签到）")
-        return get_oiioii_card()  # 诚实返回：不谎报成功
-    else:
-        _oiioii_record(False, "签到返回异常：" + str(r)[:200])
-        raise RuntimeError("OiiOii 签到失败：" + str((r or {}).get("error") or code))
-    return get_oiioii_card()
-
+        return ""
 
 # ============================ 华为码道（DevCloud）签到适配器 ============================
 # 官方接口（华为 DevCloud 码道 chat）：
@@ -2565,8 +2367,9 @@ def _lk_api(path, method="GET", body=None):
         "Referer": "https://link-ai.tech/console/account",
         "Accept": "application/json",
     }
-    if LINKAI_TOKEN:
-        headers["Authorization"] = "Bearer %s" % LINKAI_TOKEN
+    _tok = _lk_token()
+    if _tok:
+        headers["Authorization"] = "Bearer %s" % _tok
     if body is not None:
         headers["Content-Type"] = "application/json"
     data = json.dumps(body).encode() if body is not None else None
@@ -2600,7 +2403,7 @@ def _lk_record(ok, msg):
 
 
 def get_lk_card():
-    if not LINKAI_TOKEN:
+    if not _lk_token():
         return {
             "name": "linkai",
             "title": "Link AI 每日签到",
@@ -2623,16 +2426,23 @@ def get_lk_card():
         d = _lk_api("/sign/in")
         lr = _lk_read_last()
         checked = False
-        needs_captcha = False
         if d.get("success"):
             # 真正签到成功（服务端返回积分）才认可
             checked = True
-        elif d.get("code") == 870:
-            # 870 真实 message 是「签到失败」：服务端要求图片验证码(captchaVerification)，
-            # 脚本无验证码、自动签到不可行；且无法确认用户是否已在网页手动签，故诚实标「需手动」
-            needs_captcha = True
+        elif d.get("code") in (870, 834):
+            # 870 = 服务端要求滑块验证码。**注意这个码是恒定的**——
+            #   不论今天签没签过，只要没带 captchaVerification 就返回它，
+            #   所以它**不含「今天是否已签」的信息**，不能据此判断。
+            # 834 = 今日已签到，请明日再来 —— 这个才是明确的「已签」信号，
+            #   只有带上验证码提交时服务端才会给出。
+            msg = d.get("message") or ""
+            if d.get("code") == 834 or "已签到" in msg:
+                checked = True
         else:
             raise RuntimeError(d.get("message") or "状态查询失败")
+        # 兜底：本地记录里今天有成功签到（含定时任务签的），也算已签
+        if not checked and _lk_signed_today():
+            checked = True
         # 用户在网页手动签到后点了「我已在网页签到」确认：本地记录即视为今日已签
         if manual:
             checked = True
@@ -2650,21 +2460,22 @@ def get_lk_card():
             {
                 "k": "签到状态",
                 "v": ("✅ 今日已签（网页手动确认）" if manual
-                      else ("✅ 今日已签" if checked else "需网页手动签到")),
+                      else ("✅ 今日已签" if checked else "待签到")),
             },
         ]
         if manual:
             rows.append(
                 {
                     "k": "说明",
-                    "v": "你已在网页完成签到并确认；服务器无法自动代签，此状态为本地记录，每日重置",
+                    "v": "你此前在网页完成过签到并确认；此状态为本地记录，每日重置",
                 }
             )
-        elif needs_captcha:
+        elif not checked:
             rows.append(
                 {
                     "k": "说明",
-                    "v": "自动签到不可用：服务端要求图片验证码，脚本无法自动完成；请在网页手动签到后点「我已在网页签到」",
+                    "v": "服务端要求滑块验证码，已支持自动破解（见 lk_captcha_solver.py）；"
+                         "点「立即签到」即可自动完成",
                 }
             )
         if lr:
@@ -2678,6 +2489,10 @@ def get_lk_card():
                     ),
                 }
             )
+        # Link AI 现已全自动（自动过滑块验证码），不再是「手动签到」平台。
+        # 因此这里不再挂 manual_cta_url（那个字段会让卡片渲染成「🌐 网页签到 +
+        # ✅ 我已在网页签到」的手动按钮组）。manual_signed_today 仅作历史兼容保留，
+        # 老用户之前手动确认过的记录仍能正确显示为已签。
         return {
             "name": "linkai",
             "title": "Link AI 每日签到",
@@ -2685,18 +2500,14 @@ def get_lk_card():
             "brand2": "#2563EB",
             "icon": "lk",
             "checked": checked,
-            "needs_auth": True,
-            "hide_auth_link": True,
             "manual_signed_today": manual,
-            "manual_cta_url": "https://link-ai.tech/console/account?bind=1",
-            "manual_cta_label": "🌐 网页签到",
-            "badge": ("已签·手动确认" if manual else ("需手动" if needs_captcha else None)),
+            "badge": ("已签到" if (checked or manual) else "待签到"),
             "metric_label": "可用积分",
             "metric_value": bal,
             "credit": {"balance": (str(bal) if bal not in (None, "--") else None), "unit": "积分", "expiring": None},
             "last_run": lr,
             "rows": rows,
-            "error": (None if manual else ("需网页手动签到（图片验证码）" if needs_captcha else None)),
+            "error": None,
         }
     except Exception as e:
         return _auth_fail_card(
@@ -2708,8 +2519,23 @@ def get_lk_card():
 
 
 def run_lk_checkin():
-    if not LINKAI_TOKEN:
+    """Link AI 自动签到。
+
+    历史：这里曾经因为「服务端要求图片验证码」而永久失败（code=870），
+    只能靠用户在网页手动签到后点按钮确认。
+
+    2026-10-16 起改为自动绕过滑块：
+      Link AI 用的是开源 AJ-Captcha 的 blockPuzzle 模式，两个可利用点——
+        ① /api/captcha/get 与 /api/captcha/check 完全无鉴权；
+        ② 服务端把【完整原图】和【缺口小块】一起下发，小块带 alpha 通道，
+           可用「alpha 掩膜 + 逐列像素差」精确反推缺口 x 坐标。
+      实测连续 5 轮全部一次通过，最优解与次优解差异呈断层，信号干净。
+    实现见 lk_captcha_solver.py。
+    """
+    if not _lk_token():
         raise RuntimeError("未配置 Link AI Token（linkai_token.txt 或 LINKAI_TOKEN）")
+
+    # 第一跳：先不带验证码试一次。若服务端此刻不要求，直接成功，省一次往返。
     d = _lk_api("/sign/in")
     if d.get("success"):
         points = (
@@ -2717,14 +2543,52 @@ def run_lk_checkin():
         )
         _lk_record(True, "今日 +%s 积分" % points)
         return get_lk_card()
+
     code = d.get("code")
-    if code == 870:
-        # 服务端要求图片验证码，自动签到不可行，如实记录失败，不谎报成功
-        _lk_record(False, "自动签到失败：服务端要求图片验证码(captchaVerification)，脚本无法完成，请网页手动签到")
+    msg = d.get("message") or ""
+
+    # 834 = 今日已签到，请明日再来 —— 这是【成功】状态，不是失败。
+    # 定时任务若在用户已手动/已自动签完之后再跑，就会撞上这个码；
+    # 把它当失败会让卡片错误地显示 ⚠️。
+    if code == 834 or "已签到" in msg:
+        _lk_record(True, "今日已签到（%s）" % (msg or "重复签到被拒，视为已签"))
+        return get_lk_card()
+
+    # 判断是否属于「需要过验证码」的情况：
+    #   870  服务端要求滑块验证码（实测真实 message 是「签到失败」）；
+    #   999  未知异常（token 过期时返回，异常发生在鉴权之后）；
+    #   另外若 message 里直接提到 captchaVerification 也认。
+    needs_captcha = (code in (870, 999)) or ("captchaVerification" in msg)
+    if not needs_captcha:
+        raise RuntimeError(msg or "Link AI 签到失败 (code=%s)" % code)
+
+    # 第二跳：自动破解滑块拿 captchaVerification，再提交一次。
+    try:
+        import lk_captcha_solver
+        verification = lk_captcha_solver.solve_captcha()
+    except Exception as e:
+        _lk_record(False, "滑块验证码自动破解失败：%s: %s" % (type(e).__name__, e))
         raise RuntimeError(
-            "Link AI 自动签到需网页图片验证码，暂不支持自动；请前往 link-ai.tech 手动签到"
+            "Link AI 签到需要过滑块验证码，自动破解这次没成功（%s: %s）。"
+            "请稍后重试，或前往 link-ai.tech 手动签到" % (type(e).__name__, e)
         )
-    raise RuntimeError(d.get("message") or "Link AI 签到失败 (code=%s)" % code)
+
+    d2 = _lk_api("/sign/in?" + urlencode({"captchaVerification": verification}))
+    if d2.get("success"):
+        points = (
+            d2.get("data", {}).get("points") or d2.get("data", {}).get("score") or "?"
+        )
+        _lk_record(True, "今日 +%s 积分（已自动通过滑块验证）" % points)
+        return get_lk_card()
+
+    # 破解成功但业务层拒绝：834 是「今日已签」，同样算成功
+    c2, m2 = d2.get("code"), (d2.get("message") or "")
+    if c2 == 834 or "已签到" in m2:
+        _lk_record(True, "今日已签到（%s）" % (m2 or "重复签到被拒，视为已签"))
+        return get_lk_card()
+
+    _lk_record(False, "提交 captchaVerification 后仍失败：code=%s %s" % (c2, m2))
+    raise RuntimeError(m2 or "Link AI 签到失败 (code=%s)" % c2)
 
 
 def _lk_read_last():
@@ -2740,6 +2604,38 @@ def _lk_read_last():
     return None
 
 
+def _lk_signed_today():
+    """判断「今天是否已经签到成功过」。
+
+    为什么不能直接看 /sign/in 的返回？
+      实测发现 `870 签到失败` 是**恒定**返回的——不论今天签没签过，
+      只要请求里没带 captchaVerification，它都是 870。
+      也就是说这个响应**不含「今天是否已签」的信息**。
+      只有带上验证码提交时，服务端才会区分出
+      `200 + score`（本次签成功）和 `834 今日已签到`（重复签到）。
+
+    所以「今天签没签」只能靠本地记录判断：回看 lk_last_run.json，
+    找 `ok == true` 且日期是今天的记录。
+    """
+    today = time.strftime("%Y-%m-%d")
+    try:
+        with open(LK_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(data, list):
+        return False
+    for rec in reversed(data):
+        if not isinstance(rec, dict):
+            continue
+        ts = str(rec.get("ts") or "")
+        if ts[:10] != today:
+            continue        # 只关心今天
+        if rec.get("ok"):
+            return True
+    return False
+
+
 def _lk_manual_signed_today():
     """用户已在网页手动签到后，点「我已在网页签到」确认；本地记录今天已签，
     使卡片如实显示「已签」而无需服务器代签（LinkAI 签到接口已加图片验证码，服务端无法自动完成）。"""
@@ -2751,7 +2647,7 @@ def _lk_manual_signed_today():
 
 
 def set_lk_manual_signed():
-    if not LINKAI_TOKEN:
+    if not _lk_token():
         raise RuntimeError("未配置 Link AI Token（linkai_token.txt 或 LINKAI_TOKEN）")
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     _append_rec(
@@ -2770,7 +2666,7 @@ def set_lk_manual_signed():
 
 
 def get_lk_detail():
-    if not LINKAI_TOKEN:
+    if not _lk_token():
         raise RuntimeError("未配置 Link AI Token")
     history = _load_json_records(LK_STATE_FILE, 30)
     bal = "--"
@@ -2931,6 +2827,10 @@ def get_wb_card():
             "metric_label": "累计积分",
             "metric_value": st.get("total"),
             "credit": {"balance": (str(st["remaining"]) if st.get("remaining") is not None else None), "unit": "积分", "expiring": None},
+            # 卡面摘要：昨日用量（官方「积分消耗明细」真实消耗）。None 表示暂未取到 → 前端整行不渲染
+            "usage_yesterday": st.get("usage"),
+            # 概览条用：今日签到已得积分（None = 该平台没有此口径，概览条会跳过）
+            "today_credit": st.get("today"),
             "last_run": lr,
             "rows": rows,
             "error": None,
@@ -3076,6 +2976,8 @@ def get_qf_card():
             "metric_label": "可用积分",
             "metric_value": points.get("available", "--"),
             "credit": {"balance": (str(points.get("available")) if points.get("available") not in (None, "--") else None), "unit": "积分", "expiring": None},
+            # 概览条用：今日签到已得积分（千帆 status 已带 todayPoints，缺失则为 None）
+            "today_credit": points.get("todayPoints"),
             "last_run": last_run,
             "qfdaily_entry": _qf_activity_entry(),
             "rows": rows,
@@ -3608,10 +3510,17 @@ def run_jimeng_checkin():
 #   早前判定的「必须 a_bogus、服务端无法代签」是误判——彼时 710010702 源于头不全 + gzip 未解压导致的解析异常。
 #   故服务端可真实代签；仅已签当日返回 idempotent:true（幂等成功，如实回报）。
 DOUBAO_COOKIE = os.environ.get("DOUBAO_COOKIE", "")
+DOUBAO_COOKIE_FILE = os.path.join(BASE_DIR, "doubao_cookie.txt")
+# 是否由环境变量强制指定（是则忽略磁盘文件，不再热加载）
+_DB_COOKIE_FROM_ENV = bool(DOUBAO_COOKIE)
+# 记录上次读盘时的 (mtime_ns, size)，用于判断文件是否被 upload-cookie 改写
+_DB_COOKIE_SIG = None
 if not DOUBAO_COOKIE:
     try:
-        with open(os.path.join(BASE_DIR, "doubao_cookie.txt"), "r", encoding="utf-8") as _f:
+        with open(DOUBAO_COOKIE_FILE, "r", encoding="utf-8") as _f:
             DOUBAO_COOKIE = _f.read().strip()
+        _st = os.stat(DOUBAO_COOKIE_FILE)
+        _DB_COOKIE_SIG = (_st.st_mtime_ns, _st.st_size)
     except Exception:
         DOUBAO_COOKIE = ""
 DOUBAO_STATE_FILE = os.path.join(BASE_DIR, "doubao_last_run.json")
@@ -3625,10 +3534,42 @@ DOUBAO_QP = ("version_code=20800&language=zh&device_platform=pc&doubao_device_pl
              "&samantha_web=0&web_platform=pc&runtime=pc")
 
 
+def _db_reload_cookie(force=False):
+    """热加载 doubao_cookie.txt。
+
+    背景（2026-10-12 修复）：DOUBAO_COOKIE 原为「进程启动时读一次的模块级常量」，而
+    /api/doubao/upload-cookie 只写文件不更新内存 —— 本机签名器推送新 cookie 后，运行中的
+    服务仍拿旧 cookie 查询，卡片会长期显示「待签到」（而磁盘上的文件其实是对的），必须重启
+    服务才恢复。改为按 (mtime, size) 判断文件是否变化，变了就重读，使 cookie 同步即时生效。
+    """
+    global DOUBAO_COOKIE, _DB_COOKIE_SIG
+    if _DB_COOKIE_FROM_ENV:
+        return DOUBAO_COOKIE
+    try:
+        st = os.stat(DOUBAO_COOKIE_FILE)
+        sig = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        return DOUBAO_COOKIE
+    if not force and sig == _DB_COOKIE_SIG:
+        return DOUBAO_COOKIE
+    try:
+        with open(DOUBAO_COOKIE_FILE, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+    except Exception:
+        return DOUBAO_COOKIE
+    _DB_COOKIE_SIG = sig
+    if val != DOUBAO_COOKIE:
+        # flush=True：本服务 stdout 走 journald 是块缓冲的，不 flush 这行日志可能滞后很久才可见
+        print("[doubao] 检测到 doubao_cookie.txt 变更，已热加载新会话（%d 字节）" % len(val), flush=True)
+        DOUBAO_COOKIE = val
+    return DOUBAO_COOKIE
+
+
 def _db_cookie():
     """返回可直接用于 Cookie 头的字符串。支持两种配置：
-    1) 整段 cookie 串（含 sessionid=...）；2) 仅 sessionid 值（按 doubao 约定拼 sessionid + sessionid_ss）。"""
-    c = (DOUBAO_COOKIE or "").strip()
+    1) 整段 cookie 串（含 sessionid=...）；2) 仅 sessionid 值（按 doubao 约定拼 sessionid + sessionid_ss）。
+    每次调用前会按文件 mtime 热加载，保证 upload-cookie 推送后无需重启即生效。"""
+    c = (_db_reload_cookie() or "").strip()
     if not c:
         return ""
     if "sessionid=" in c:
@@ -3761,7 +3702,7 @@ def get_doubao_card():
         }
     # 用 v3/detail 读活动详情（含每日签到任务真实状态）；失败则回退 landing/get
     try:
-        code, data, _ = _db_request(
+        code, data, raw = _db_request(
             "/alice/ug/campaign/v3/detail/", {"campaign_group_code": DOUBAO_SCENE}
         )
     except RuntimeError as e:
@@ -3775,6 +3716,23 @@ def get_doubao_card():
                 {"k": "如何恢复", "v": "重新登录 doubao.com，F12 → Application → Cookies → sessionid，存入 doubao_cookie.txt"},
             ],
             "error": None,
+        }
+    # 接口非成功码 / data 为空：如实报「查询失败」。
+    # （旧版直接 `data = data or {}` 继续走，会把风控/异常响应静默渲染成「⏳ 待签到」，
+    #   导致「实际已签、卡片却显示未签」且看不出任何错误——2026-10-12 修复。）
+    if code != 0 or not isinstance(data, dict):
+        _msg = str((raw or {}).get("msg") or (raw or {}).get("message") or "")[:80]
+        return {
+            "name": "doubao", "title": "豆包 每日签到", "brand": "#FF6A00", "brand2": "#FF9248",
+            "icon": "doubao", "checked": False, "needs_auth": False, "auth_url": "https://www.doubao.com/",
+            "metric_label": "今日签到", "metric_value": "查询失败",
+            "last_run": _db_read_last(),
+            "rows": [
+                {"k": "今日签到", "v": "⚠️ 状态查询失败（不代表未签到）"},
+                {"k": "接口返回", "v": "code=%s%s" % (code, ("，" + _msg) if _msg else "")},
+                {"k": "处理建议", "v": "多为豆包风控/接口抖动，稍后刷新即可；持续失败请检查 doubao_cookie.txt 会话是否有效"},
+            ],
+            "error": "豆包状态查询失败：code=%s" % code,
         }
     lr = _db_read_last()
     # 从 tasks 里找每日签到任务（campaign_code == 'daily_signin' / task_kind == 'daily_signin'）
@@ -3830,6 +3788,8 @@ def get_doubao_card():
         "icon": "doubao", "checked": checked,
         "metric_label": "今日签到", "metric_value": "已签到" if checked else "待签到",
         "tasks_entry": tasks_entry,
+        # 概览条用：豆包口径是「额度」不是积分，且只有已签时才算今日所得，故不上报（避免单位混算）
+        "today_credit": None,
         "last_run": lr, "rows": rows, "error": None,
     }
 
@@ -3885,13 +3845,23 @@ ADAPTERS = {
     "huawei": get_hw_card,
     "coze": get_coze_card,
     "jimeng": get_jimeng_card,
-    "oiioii": get_oiioii_card,
 }
 
 # 卡片分组标签（与上面顺序一致）：auto = 全自动；其余 = 需偶尔维护凭据
 # 注：qoder 不在 AUTO_PLATFORMS——领取由本机守护 qoder_keeper 完成（需设备指纹，服务端无法
 # 代领，详见 run_qd_checkin 注释），服务端卡片只展示守护推送的 qoder_local_status.json。
-AUTO_PLATFORMS = ("workbuddy", "qianfan", "doubao", "minimax", "qoder", "lingxi", "trae", "coze", "jimeng")
+#
+# linkai / huawei 于 2026-10-16 从「手动组」移入「自动组」：
+#   · linkai —— 原本因「服务端强制图片验证码」只能网页手动签；现已用
+#     lk_captcha_solver.py 自动破解 AJ-Captcha 滑块，端到端实测成功（详见 README）。
+#   · huawei —— 其实一直是全自动的（服务器那份 cookie 每 30~60 分钟由本机
+#     hw_autopush 续传），hw_last_run.json 显示 9-24 起每天 08:31 自动 +1000 积分、
+#     从未失败。之前错放在手动组，是因为它的 cookie 短效、需要在失效时人工重登，
+#     但那属于「偶尔维护凭据」，和 trae/lingxi 同理，不影响它归入自动签到。
+#     注：cookie 失效时的恢复指引仍在 _manual_guide() 里保留（见 get_hw_card 的
+#     manual_guide 挂载），不会因为移出手动组而丢失。
+AUTO_PLATFORMS = ("workbuddy", "qianfan", "doubao", "minimax", "qoder", "linkai",
+                  "lingxi", "trae", "coze", "jimeng", "huawei")
 # 「派猫猫旅行」不再单独成卡，它作为 WorkBuddy 卡内的入口（弹窗），但仍是全自动项目：
 # 每天派出 + 到点自动领奖，所以「立即全部签到」/每日自动要把 travel 一起带上。
 AUTO_RUN = AUTO_PLATFORMS + ("travel",)
@@ -4316,7 +4286,6 @@ OFFICIAL_SITES = {
     "trae":      ("https://www.trae.cn/events/code-fission/J237PUTE7HES?utm_source=copy_link&utm_medium=code_fission", "Trae 官网"),
     "coze":      ("https://www.coze.cn/", "扣子 Coze 官网"),
     "jimeng":    ("https://jimeng.jianying.com/", "即梦 AI 官网"),
-    "oiioii":    ("https://oiioii.ai", "OiiOii AI 创作端"),
 }
 
 
@@ -4430,6 +4399,9 @@ def get_center():
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "signed_count": signed,
         "total_count": len(ADAPTERS),
+        # 概览条要用的调度信息（前端不用再单独打一次 /api/settings）
+        "schedule_enabled": bool(SETTINGS.get("schedule_enabled", True)),
+        "schedule_time": SETTINGS.get("schedule_time", "08:35"),
         "items": items,
     }
 
@@ -4460,8 +4432,6 @@ def run_checkin_for(name):
         return run_jimeng_checkin()
     if name == "doubao":
         return run_doubao_checkin()
-    if name == "oiioii":
-        return run_oiioii_checkin()
     if name == "lingxi":
         return run_lx_checkin()
     if name == "linkai":
@@ -4541,6 +4511,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
   border:1px solid rgba(0,194,154,.1);}
 .summary .top{display:flex;justify-content:space-between;align-items:center;font-size:14px;font-weight:700;}
 .summary .top .n{color:var(--wb-brand-8);font-variant-numeric:tabular-nums;}
+/* ===== 统计概览条（参考后台管理台的聚合数字，一屏看全关键指标）===== */
+#stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;margin-top:13px;
+  background:var(--line);border:1px solid var(--line);border-radius:13px;overflow:hidden;}
+.stat{background:#fff;padding:10px 11px 11px;min-width:0;}
+.stat .sl{font-size:11px;color:#9dabba;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.stat .sv{margin-top:3px;font-size:16px;font-weight:800;color:#1e293b;letter-spacing:-.3px;
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.stat .sv small{font-size:11px;font-weight:600;color:#94a3b8;margin-left:1px;letter-spacing:0;}
+.stat.warn .sv{color:#b54708;}
+.stat.ok .sv{color:#00614D;}
 .bar{height:7px;border-radius:999px;background:#edf3f1;margin-top:11px;overflow:hidden;}
 .bar > i{display:block;height:100%;width:0;border-radius:999px;
   background:linear-gradient(90deg,var(--wb-grad-a),var(--wb-grad-b));
@@ -4594,6 +4574,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
   font-variant-numeric:tabular-nums;
   background:linear-gradient(135deg,var(--c,#00C29A),var(--c2,#00C885));
   -webkit-background-clip:text;background-clip:text;color:transparent;}
+/* 主指标下方摘要行（如 WorkBuddy 的「昨日用量」，相当于参考界面的「昨日用量 10.19」） */
+.msub{margin-top:5px;font-size:12px;color:#7c8899;font-variant-numeric:tabular-nums;}
+.msub b{color:#475569;font-weight:700;}
 .rows{margin-top:6px;border-top:1px solid var(--line);}
 .row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 1px;
   border-bottom:1px solid var(--line);font-size:13px;}
@@ -4803,6 +4786,7 @@ button.entry:hover{background:#eef7f4;}
   <div class="summary">
     <div class="top"><span>今日签到进度</span><span class="n" id="summary">-- / --</span></div>
     <div class="bar"><i id="prog"></i></div>
+    <div id="stats"></div>
   </div>
 
   <div id="tabs"></div>
@@ -4823,7 +4807,7 @@ button.entry:hover{background:#eef7f4;}
     <input id="key" type="password" inputmode="numeric" placeholder="输入访问口令后回车">
   </div>
 
-  <div class="hint">页面分「自动签到 / 手动签到」两个标签：自动标签里的平台每天到点自动签；手动标签里的平台凭据短效或服务端拒绝自动签到，按卡面提示维护即可。<br>所有签到均在服务端执行，数据来自各平台官方接口</div>
+  <div class="hint" id="pgHint">所有平台均为全自动：每天到点（设置里的时间）自动签到，也可随时点「立即全部签到」手动触发一次。<br>所有签到均在服务端执行，数据来自各平台官方接口</div>
   <div class="vtag" id="vtag" style="margin-top:14px;font-size:12px;color:var(--sub);text-align:center;opacity:.8">v20260922-1</div>
 </div>
 
@@ -4837,7 +4821,6 @@ function esc(s){ s=String(s==null?"":s); return s.replace(/&/g,"&amp;").replace(
 var ICON_WB = `__WB_SVG__`;
 var ICON_JIMENG = `__JIMENG_SVG__`;
 var ICON_DOUBAO = `__DOUBAO_SVG__`;
-var ICON_OIICII = `__OIICII_SVG__`;
 var ICON_QF = `__QF_SVG__`;
 var ICON_MM = `__MM_SVG__`;
 var ICON_TRAE = `__TRAE_SVG__`;
@@ -4859,7 +4842,6 @@ function iconFor(it){
   if(it.icon==="coze") return '<img class="cilogo" src="data:image/png;base64,__COZE_LOGO_B64__">';
   if(it.icon==="jimeng") return ICON_JIMENG;
   if(it.icon==="doubao") return ICON_DOUBAO;
-  if(it.icon==="oiioii") return ICON_OIICII;
   if(it.icon==="growth") return ICON_GROWTH;
   if(it.icon==="daily") return ICON_DAILY;
   if(it.icon==="travel") return '<div style="font-size:20px">🧳</div>';
@@ -4882,6 +4864,17 @@ function creditHTML(it){
   return h;
 }
 
+function msubHTML(it){
+  // 主指标下方的一行摘要（卡面上的「一眼看懂」补充）
+  // WorkBuddy：昨日用量 —— 官方「积分消耗明细」的真实消耗，不用点开详情就能看到；
+  //             接口没返回（抖动 / 未缓存）时整行不渲染，绝不留白或写 0 误导。
+  if(it.name !== 'workbuddy') return '';
+  var u = it.usage_yesterday;
+  if(u == null || u === '') return '';
+  var n = Number(u);
+  if(isNaN(n)) return '';
+  return '<div class="msub">昨日用量 <b>'+esc(n.toFixed(2))+'</b> 分</div>';
+}
 function cardHTML(it){
   var manualTag = it.group==='manual' ? '<span class="badge manual">✋ 手动</span>' : '';
   if(it.disabled){
@@ -4943,6 +4936,7 @@ function cardHTML(it){
           '<div class="ctitle">'+esc(it.title)+'</div>'+ manualTag + badge +
         '</div>'+
         '<div class="metric"><span class="mlabel">'+esc(it.metric_label)+'</span><br><span class="mval">'+esc(it.metric_value)+'</span></div>'+
+        msubHTML(it) +
         creditHTML(it) +
         '<div class="rows">'+rows+'</div>'+
         (it.checked ? '' : '<div class="last">上次签到：'+last+'</div>')+
@@ -5342,11 +5336,16 @@ function renderDetail(d, name){
   } else if(d.name === 'huawei'){
     signinHTML += '<button class="cta login-cookie" type="button" data-name="huawei" style="margin:6px 0 2px">🔑 配置 / 更换会话 Cookie</button>';
   } else if(d.name === 'linkai'){
-    if(signin.manual_signed_today){
-      signinHTML += '<div class="drow"><span class="dk">今日状态</span><span class="dv">✅ 已签（网页手动确认）</span></div>';
+    // Link AI 现已支持自动过滑块验证码，不再是「必须网页手动签」。
+    // 优先看自动签到结果（signin.checked）；manual_signed_today 只是老用户的兜底路径。
+    if(signin.checked){
+      signinHTML += '<div class="drow"><span class="dk">今日状态</span><span class="dv">'
+                  + (signin.manual_signed_today ? '✅ 已签（网页手动确认）' : '✅ 已签（自动过滑块）')
+                  + '</span></div>';
     } else {
-      signinHTML += '<div class="drow"><span class="dk">今日状态</span><span class="dv">⏳ 需网页手动签到</span></div>';
-      signinHTML += '<button class="cta manual-signed" type="button" data-name="linkai" style="margin:6px 0 2px">✅ 我已在网页签到</button>';
+      signinHTML += '<div class="drow"><span class="dk">今日状态</span><span class="dv">⏳ 待签到</span></div>';
+      signinHTML += '<div class="drow"><span class="dk">说明</span><span class="dv">服务端要求滑块验证码，已支持自动破解；点下方「立即签到」即可自动完成。</span></div>';
+      signinHTML += '<button class="cta" type="button" data-name="linkai" style="margin:6px 0 2px">🔄 立即签到</button>';
     }
   }
   if(!signinHTML){
@@ -5636,7 +5635,7 @@ function showMain(){
   var el=$('focus'); if(el){ el.style.display='none'; el.innerHTML=''; }
   load();
 }
-var PLATFORMS = {workbuddy:"WorkBuddy",qianfan:"百度千帆",minimax:"MiniMax Code",qoder:"Qoder",linkai:"Link AI",lingxi:"WPS 灵犀",trae:"Trae Work",huawei:"华为码道",coze:"Coze 扣子",jimeng:"即梦 AI",doubao:"豆包",oiioii:"OiiOii AI",};
+var PLATFORMS = {workbuddy:"WorkBuddy",qianfan:"百度千帆",minimax:"MiniMax Code",qoder:"Qoder",linkai:"Link AI",lingxi:"WPS 灵犀",trae:"Trae Work",huawei:"华为码道",coze:"Coze 扣子",jimeng:"即梦 AI",doubao:"豆包",};
 function focusSettings(){
   var el=$('focus');
   el.innerHTML='<a class="back" id="backBtn">‹ 返回签到中心</a><div id="fbody" class="settings"></div>';
@@ -5741,9 +5740,17 @@ function manualCardHTML(it){
 
 function renderTabs(aN, aD, mN, mT){
   var el = $('tabs'); if(!el) return;
+  // 所有平台都进了自动组时，不再渲染「手动签到」tab（空 tab 没有意义）。
+  // 若当前正停在被隐藏的 tab 上，自动切回 auto，避免用户看到一个空页面。
+  if(mN === 0 && TAB === 'manual'){
+    TAB = 'auto';
+    try { localStorage.setItem('wb_tab', TAB); } catch(e){}
+  }
   el.innerHTML =
     '<button class="tab '+(TAB==='auto'?'on':'')+'" data-tab="auto"><span class="tc"><span>🤖 自动签到</span><span class="cnt">'+aD+'/'+aN+'</span></span></button>'
-    + '<button class="tab '+(TAB==='manual'?'on':'')+'" data-tab="manual"><span class="tc"><span>✋ 手动签到</span><span class="cnt">'+mT+' 待处理</span></span></button>';
+    + (mN > 0
+        ? '<button class="tab '+(TAB==='manual'?'on':'')+'" data-tab="manual"><span class="tc"><span>✋ 手动签到</span><span class="cnt">'+mT+' 待处理</span></span></button>'
+        : '');
   Array.prototype.forEach.call(el.querySelectorAll('.tab'), function(t){
     t.addEventListener('click', function(){
       TAB = t.getAttribute('data-tab');
@@ -5753,6 +5760,50 @@ function renderTabs(aN, aD, mN, mT){
   });
 }
 
+function fmtNum(v){
+  var n = Number(v);
+  if(isNaN(n)) return esc(v);
+  // 去掉无意义的尾随 0：1230.00 -> 1230，12.30 -> 12.3
+  return String(Math.round(n * 100) / 100);
+}
+function renderStats(d, items){
+  var el = $('stats'); if(!el) return;
+  var live = items.filter(function(it){ return !it.disabled; });
+  // 需维护：手动组里未签到 / 凭据失效 / 带 error 的（诚实计数，不掩盖故障）
+  var todo = live.filter(function(it){
+    return it.group==='manual' ? (!it.checked || it.needs_auth) : (it.needs_auth || it.error);
+  }).length;
+  // 可用积分：各平台 credit.balance 求和（少数平台单位不同或为 —，跳过）
+  var bal = 0, hasBal = false;
+  live.forEach(function(it){
+    var c = it.credit || {};
+    if(c.balance==null || c.balance==='') return;
+    var n = Number(c.balance);
+    if(!isNaN(n)){ bal += n; hasBal = true; }
+  });
+  // 今日已得：今日签到积分之和（WorkBuddy 的 today 字段）
+  var gained = 0, hasGain = false;
+  live.forEach(function(it){
+    if(it.today_credit==null) return;
+    var n = Number(it.today_credit);
+    if(!isNaN(n)){ gained += n; hasGain = true; }
+  });
+  var next = (d.schedule_enabled!==false)
+    ? (d.schedule_time || '08:35')
+    : null;
+  var cells = [
+    {l:'平台',        v:live.length,                 s:''},
+    {l:'已签到',      v:d.signed_count,              s:'/'+d.total_count, c:d.signed_count>=live.length?'ok':''},
+    {l:'需维护',      v:todo,                        s:'',                c:todo>0?'warn':''},
+    {l:'可用积分',    v:hasBal?fmtNum(bal):'—',      s:'',                c:''},
+    {l:'今日已得',    v:hasGain?('+'+fmtNum(gained)):'—', s:'',           c:hasGain?'ok':''},
+    {l:'下次自动',    v:next||'已关闭',              s:'',                c:next?'':'warn'},
+  ];
+  el.innerHTML = cells.map(function(c){
+    return '<div class="stat '+c.c+'"><div class="sl">'+esc(c.l)+'</div>'
+         + '<div class="sv">'+esc(String(c.v))+(c.s?'<small>'+esc(c.s)+'</small>':'')+'</div></div>';
+  }).join('');
+}
 function renderCenter(d){
   if(!d.ok){ $("summary").textContent="读取失败"; showMsg(d.error||"读取失败","err"); return; }
   LAST_CENTER = d;
@@ -5763,7 +5814,16 @@ function renderCenter(d){
   var manual = d.items.filter(function(it){ return it.group==='manual'; });
   var autoDone = auto.filter(function(it){ return it.checked && !it.disabled; }).length;
   var manualTodo = manual.filter(function(it){ return !it.checked || it.needs_auth; }).length;
+  renderStats(d, d.items);
   renderTabs(auto.length, autoDone, manual.length, manualTodo);
+  // 底部说明随分组状态自适应：全部自动化时不再提「两个标签」，避免与界面不符
+  var hintEl = $('pgHint');
+  if(hintEl){
+    hintEl.innerHTML = (manual.length
+      ? '页面分「自动签到 / 手动签到」两个标签：自动标签里的平台每天到点自动签；手动标签里的平台凭据短效或服务端拒绝自动签到，按卡面提示维护即可。'
+      : '所有平台均为全自动：每天到点（设置里的时间）自动签到，也可随时点「立即全部签到」手动触发一次。')
+      + '<br>所有签到均在服务端执行，数据来自各平台官方接口';
+  }
   var items = (TAB==='manual') ? manual : auto;
   var html = "";
   if(TAB==='auto'){
@@ -6097,7 +6157,6 @@ PAGE = PAGE.replace("__HW_SVG__", HW_SVG)
 PAGE = PAGE.replace("__QD_SVG__", QD_SVG)
 PAGE = PAGE.replace("__JIMENG_SVG__", JIMENG_SVG)
 PAGE = PAGE.replace("__DOUBAO_SVG__", DOUBAO_ICON)
-PAGE = PAGE.replace("__OIICII_SVG__", OIICII_SVG)
 PAGE = PAGE.replace("__GROWTH_SVG__", GROWTH_SVG)
 PAGE = PAGE.replace("__DAILY_SVG__", DAILY_SVG)
 PAGE = PAGE.replace("__COZE_LOGO_B64__", COZE_LOGO_B64)
@@ -6448,10 +6507,76 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(c, dict) and c.get("name") == "sessionid" and c.get("value"):
                         sid = c["value"]; break
                 if sid:
-                    with open(os.path.join(BASE_DIR, "doubao_cookie.txt"), "w", encoding="utf-8") as _f:
+                    with open(DOUBAO_COOKIE_FILE, "w", encoding="utf-8") as _f:
                         _f.write(sid)
-                dlog("doubao cookie 已同步到服务器，共 %d 条" % len(arr))
+                # 立刻热加载到内存：否则运行中的进程仍用旧会话查询，卡片会一直显示「待签到」
+                _db_reload_cookie(force=True)
+                print("[doubao] cookie 已同步到服务器，共 %d 条" % len(arr))
                 self._json(200, {"ok": True, "cookie_count": len(arr), "has_sessionid": bool(sid)})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/wb/upload-token":
+            # 新版 WorkBuddy 把本地会话文件加密后，只有本机（装着 WorkBuddy 的那台）
+            # 才能解密出明文 accessToken。所以由本机的 wb_token_sync.py 解密 + 把整份
+            # token.info 推到 112，服务器只做「收下并原子落盘」。
+            #
+            # 鉴权：复用签到中心访问口令，并用 IP 白名单兜底（token 是敏感凭据，
+            # 这个接口一旦被外人调到就等于把账号交出去，所以两道都留）。
+            q = parse_qs(u.query)
+            if not self._key_ok(q):
+                self._json(401, {"ok": False, "error": "需要访问口令", "needKey": True})
+                return
+            peer = (self.client_address[0] if self.client_address else "")
+            allowed = os.environ.get("WB_UPLOAD_ALLOW_IPS", "")
+            if allowed:
+                allow = [x.strip() for x in allowed.split(",") if x.strip()]
+                if not any(peer == a for a in allow):
+                    print("[wb-token] 拒绝来自非白名单 IP 的上传: %s" % peer, flush=True)
+                    self._json(403, {"ok": False, "error": "来源 IP 不在白名单"})
+                    return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n <= 0 or n > 1024 * 1024:
+                    self._json(200, {"ok": False, "error": "请求体为空或过大"})
+                    return
+                raw = self.rfile.read(n)
+                d = json.loads(raw.decode("utf-8"))
+                # 请求体就是整份 token.info（与 SFTP 上传的文件同构）；
+                # 也容忍 {"access_token": "...", ...} 这种单独传 token 的简写。
+                if isinstance(d.get("access_token"), str):
+                    tok = d["access_token"]
+                else:
+                    tok = (d.get("auth") or {}).get("accessToken")
+                if not isinstance(tok, str) or not tok:
+                    self._json(200, {"ok": False, "error": "缺少 access_token"})
+                    return
+                if not isinstance(d.get("auth"), dict):
+                    # 简写形态：补成完整会话文件结构，保证签到侧 load_session 能直接读
+                    d = {"auth": {"accessToken": tok},
+                         "account": {"uid": d.get("uid")}}
+                    if d["account"]["uid"] is None:
+                        d.pop("account", None)
+                # 落盘目标与签到读取的是同一个文件（WB_TOKEN_FILE），保证改完立刻生效
+                target = os.environ.get("WB_TOKEN_FILE") or os.path.join(BASE_DIR, "token.info")
+                # 原子落盘：先写临时文件再 os.replace，避免半截文件被签到读到
+                tmp = target + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False, indent=1)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, target)
+                try:
+                    os.chmod(target, 0o600)
+                except Exception:
+                    pass
+                # token.info 由 _session() 每次调用时现读盘（无内存缓存），
+                # 所以落盘后下一次签到就会自动用上新 token，无需重启服务。
+                print("[wb-token] 已接收新会话 token（%d 字节，uid=%s，来自 %s）"
+                      % (len(tok), d.get("account", {}).get("uid"), peer), flush=True)
+                self._json(200, {"ok": True, "token_len": len(tok),
+                                 "uid": d.get("account", {}).get("uid"),
+                                 "file": target})
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
@@ -6627,18 +6752,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
             return
-        if u.path == "/api/oiioii/manual-signed":
-            q = parse_qs(u.query)
-            if not self._key_ok(q):
-                self._json(401, {"ok": False, "error": "需要访问口令", "needKey": True})
-                return
-            try:
-                card = set_oiioii_manual_signed()
-                self._json(200, {"ok": True, "card": card,
-                                 "message": "✅ 已记录：今日 OiiOii 网页签到完成"})
-            except Exception as e:
-                self._json(200, {"ok": False, "error": str(e)})
-            return
         if u.path == "/api/qoder/local-status":
             # 本机守护 qoder_keeper 的状态收口（HTTP 优先通道；SFTP 直写为兜底）
             q = parse_qs(u.query)
@@ -6726,7 +6839,6 @@ def run_daily_all(scope=None):
         ("coze", "Coze 扣子"),
         ("jimeng", "即梦 AI"),
         ("doubao", "豆包"),
-        ("oiioii", "OiiOii AI"),
         ("huawei", "华为码道"),
     ]
     if scope == "auto":
