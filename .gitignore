@@ -72,6 +72,8 @@ doubao_cookie.json
 linkai_token.txt
 # 凭据文件的本地备份（形如 xxx_token.txt.bak.20261016），同样含明文凭据，禁止入库
 *.bak.[0-9]*
+# refresh_creds.py pull 生成的整目录备份（内含多平台明文 token）
+cred_backup/
 *.bak.*[0-9]
 # OiiOii 已下线（平台价值低，卡片已移除）；下面两行保留，防止 _removed_oiioii/ 里
 # 遗留的旧凭据被误入库（等同账号密码）
@@ -85,8 +87,13 @@ coze_logo.png
 
 # Qoder 登录态（本机从客户端取出的 access token，禁止入库）
 qoder_token.txt
+qoder_cookie.txt
 _qd_auth.json
 _qd_campaigns_dump.json
+# 凭据备份的另一种命名（形如 qoder_token.txt.bak_20261022_090211）
+*.bak_*
+# 豆包中继口令（等同服务器访问口令，禁止入库）
+doubao_relay_key.txt
 # 千帆登录态（明文 token，禁止入库）
 qf_token.txt
 

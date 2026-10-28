@@ -24,13 +24,21 @@ const fs = require('fs');
 // ----------------------------------------------------------------------------
 // 中继通道用它调用 https://bjzjsf.asia/checkin/api/doubao/*?k=<口令>。
 // 本文件是浏览器/Node 用户脚本，没有构建步骤可注入环境变量，所以只能手填。
-// 请从你自己的 .env（ACCESS_KEY=）里复制真实值到下面这行，不要把真实口令提交：
-//   const RELAY_KEY = '你自己的访问口令';
+// 请从你自己的 .env（ACCESS_KEY=）里复制真实值到同目录的 doubao_relay_key.txt
+// （该文件已在 .gitignore），或设置环境变量 RELAY_KEY；不要把真实口令提交。
 // 留空 / 保持占位符时，中继轮询会因口令不符被服务器拒绝，其余功能不受影响。
 // ============================================================================
-const RELAY_KEY = 'PUT_YOUR_ACCESS_KEY_HERE';
-
 const path = require('path');
+const RELAY_KEY = (function () {
+  const fromEnv = (process.env.RELAY_KEY || '').trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return fs.readFileSync(path.join(__dirname, 'doubao_relay_key.txt'), 'utf8').trim()
+      || 'PUT_YOUR_ACCESS_KEY_HERE';
+  } catch (e) {
+    return 'PUT_YOUR_ACCESS_KEY_HERE';
+  }
+})();
 
 const PROFILE    = 'E:/workspace/workbuddy-signin/doubao_profile';
 const COOKIE_TXT = 'E:/workspace/workbuddy-signin/doubao_cookie.txt';

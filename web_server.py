@@ -1431,10 +1431,12 @@ def _lk_token():
 # ============================ 华为码道（DevCloud）签到适配器 ============================
 # 官方接口（华为 DevCloud 码道 chat）：
 #   查询活动   GET  https://devcloud.cn-north-4.huaweicloud.com/chat/PromptCenterService/v1/ops/delivery?channel=WEB
-#   签到领取   POST .../v1/ops/claim        body {"campaignId":1,"idempotentKey":"claim_1_<ts>","channel":"WEB"}
-#   确认       POST .../v1/ops/confirm     body {"campaignId":1}
+#   签到领取   POST .../v1/ops/claim        body {"campaignId":<实时发现>,"idempotentKey":"claim_<id>_<ts>","channel":"WEB"}
+#   确认       POST .../v1/ops/confirm     body {"campaignId":<实时发现>}
 #   鉴权       Cookie: devclouddevuibjJ_SESSION_ID=... （Edge 登录态；凭据优先级：环境变量 HW_COOKIE > hw_cookie.txt）
-#   每日签到活动：campaignId=1 type=USER_LOGIN，benefitAmount=1000 CREDIT
+#   每日签到活动：type=USER_LOGIN，campaignId 会随活动轮次变（2026-10 起为 34，此前是 1），
+#                故领取时**必须用 delivery 接口实时返回的 campaignId**，写死会在活动换轮次后报
+#                「运营事件未生效或已结束」。
 #   状态流转：ELIGIBLE(待领) -> CLAIMED/CONFIRMED/CONSUMED(已签)
 HW_STATE_FILE = os.path.join(BASE_DIR, "hw_last_run.json")
 HW_BASE = "https://devcloud.cn-north-4.huaweicloud.com/chat/PromptCenterService"
@@ -1550,7 +1552,7 @@ def _hw_read_last():
 HW_DONE_FILE = os.path.join(BASE_DIR, "hw_today_done.json")
 
 
-def _hw_mark_today_done(message=""):
+def _hw_mark_today_done(message="", amount=None):
     """记录「今天已签到成功」，供 get_hw_card 短路使用。"""
     try:
         with open(HW_DONE_FILE, "w", encoding="utf-8") as f:
@@ -1559,6 +1561,7 @@ def _hw_mark_today_done(message=""):
                     "date": datetime.date.today().isoformat(),
                     "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "message": message or "今日签到成功",
+                    "amount": amount,
                 },
                 f,
                 ensure_ascii=False,
@@ -1590,8 +1593,9 @@ def _hw_clear_today_done():
 def _hw_done_card(mark):
     """今日已签到的短路卡片：不依赖华为会话，直接展示本地成功记录。"""
     ts = mark.get("ts") or ""
+    amount = mark.get("amount") or "—"
     rows = [
-        {"k": "今日福利", "v": "1000 积分"},
+        {"k": "今日福利", "v": "%s 积分" % amount},
         {"k": "签到状态", "v": "✅ 今日已签（本地记录）"},
         {"k": "签到时间", "v": ts[5:16] if len(ts) >= 16 else ts},
         {"k": "说明", "v": "今日已成功签到，为避免华为短效会话反复失效，本卡当天不再实时查询；次日 0 点自动恢复查询。"},
@@ -1608,7 +1612,7 @@ def _hw_done_card(mark):
         "login_supported": True,
         "auth_url": "https://devcloud.cn-north-4.huaweicloud.com/chat/home",
         "metric_label": "今日积分",
-        "metric_value": "已领 1000",
+        "metric_value": "已领 %s" % amount,
         "last_run": {"ts": ts, "ok": True, "message": mark.get("message") or "今日签到成功"},
         "rows": rows,
         "error": None,
@@ -1750,23 +1754,31 @@ def run_hw_checkin():
         raise RuntimeError(d.get("message") or "华为活动查询失败")
     items = (d.get("data") or {}).get("items") or []
     camp = _hw_find_daily(items)
-    if camp and camp.get("status") in ("CLAIMED", "CONFIRMED", "CONSUMED"):
+    if not camp:
+        raise RuntimeError("未找到每日签到活动（活动可能已下线）")
+    cid = camp.get("campaignId")
+    if cid is None:
+        raise RuntimeError("每日签到活动缺少 campaignId，无法领取")
+    amount = camp.get("benefitAmount")
+    unit_cn = "积分" if (camp.get("benefitUnit") or "CREDIT") == "CREDIT" else (camp.get("benefitUnit") or "")
+    if camp.get("status") in ("CLAIMED", "CONFIRMED", "CONSUMED"):
         _hw_record(True, "今日已签到（幂等跳过）")
-        _hw_mark_today_done("今日已签到（幂等跳过）")
+        _hw_mark_today_done("今日已签到（幂等跳过）", amount)
         return get_hw_card()
     ts = int(time.time() * 1000)
     claim = _hw_api(
         "/v1/ops/claim",
         method="POST",
-        body={"campaignId": 1, "idempotentKey": "claim_1_%s" % ts, "channel": "WEB"},
+        body={"campaignId": cid, "idempotentKey": "claim_%s_%s" % (cid, ts), "channel": "WEB"},
     )
     if claim.get("code") != 0:
         raise RuntimeError(claim.get("message") or "华为签到领取失败")
-    conf = _hw_api("/v1/ops/confirm", method="POST", body={"campaignId": 1})
+    conf = _hw_api("/v1/ops/confirm", method="POST", body={"campaignId": cid})
     if conf.get("code") != 0:
         raise RuntimeError(conf.get("message") or "华为签到确认失败")
-    _hw_record(True, "今日签到成功 +1000 积分")
-    _hw_mark_today_done("今日签到成功 +1000 积分")
+    msg = "今日签到成功 +%s %s" % (amount if amount is not None else "?", unit_cn)
+    _hw_record(True, msg)
+    _hw_mark_today_done(msg, amount)
     return get_hw_card()
 
 
@@ -1776,6 +1788,62 @@ QD_TOKEN_FILE = os.path.join(BASE_DIR, "qoder_token.txt")
 QD_LOCAL_FILE = os.path.join(BASE_DIR, "qoder_local_status.json")  # 本机守护推送的今日领取状态
 QD_BASE = os.environ.get("QODER_BASE_URL", "https://openapi.qoder.sh")
 QD_AUTH_URL = "https://qoder.com/account/profile"
+
+# 网页会话 cookie 鉴权（2026-10-20 起降为兜底凭据，主路径是 token+指纹）
+#   实测结论（openapi.qoder.sh + cookie = 401 missing authorization token）：
+#     · qoder.com/sash/api/v1/me/campaigns   + cookie -> 200，但 daily CLAIM_BENEFIT 活动返回空
+#       （该活动只在 openapi+设备指纹 这条路径出现，cookie 接口查不到）
+#     · qoder.com 的 quota/usage 各变体       -> 全 404（配额只在 openapi 域）
+#     · openapi 域必须 Bearer dt- token + Cosy-Machine* 指纹，token 仅约 30 天需频繁重取
+#   故：主路径 = openapi token + 指纹重放（桌面端/服务端代领生效路径）；cookie 仅作兜底。
+#       配额展示仍走 token（token 失效时显示「—」，不谎报）。
+QD_WEB_BASE = os.environ.get("QODER_WEB_BASE_URL", "https://qoder.com")
+QD_COOKIE_FILE = os.path.join(BASE_DIR, "qoder_cookie.txt")
+QD_WEB_CAMPAIGN_PATH = "/sash/api/v1/me/campaigns"
+
+
+def _qd_cookie():
+    """读 Qoder 网页会话 cookie。
+
+    凭据优先级：环境变量 QODER_COOKIE > 同目录 qoder_cookie.txt。
+    同样**每次现读盘不缓存**（与 _qd_token() 一致），换 cookie 后无需重启服务。
+    """
+    c = (os.environ.get("QODER_COOKIE", "") or "").strip()
+    if c:
+        return c
+    try:
+        with open(QD_COOKIE_FILE, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _qd_web_headers():
+    """qoder.com 域的最小可用请求头（Cookie 鉴权 + Cosy 客户端标识）。"""
+    return {
+        "Cookie": _qd_cookie(),
+        "Cosy-ClientType": "10",
+        "Accept": "application/json",
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+        "Origin": "https://qoder.com",
+        "Referer": "https://qoder.com/account/usage",
+    }
+
+
+def _qd_web_api(path, method="GET", body=None):
+    """走 qoder.com 网页会话调接口。返回解析后的 JSON dict。"""
+    headers = _qd_web_headers()
+    if not headers["Cookie"]:
+        raise RuntimeError("未配置 Qoder 网页会话 cookie")
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        "%s%s" % (QD_WEB_BASE, path), data=data, method=method, headers=headers
+    )
+    with urllib.request.urlopen(req, timeout=25, context=_SSL_CTX) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
 
 # Qoder 每日 100 Credits 活动每天 10:00(UTC+8) 才刷新新轮次，而主定时任务在 08:35 跑、
 # 早于刷新时间。故起一个常驻线程：10:05~13:00 每 30 分钟用守护推送的指纹尝试「服务端代领」
@@ -1814,17 +1882,17 @@ def _qoder_topup_loop():
             hm = (utc8.hour, utc8.minute)
             local = _qd_local_today()
             if (10, 5) <= hm <= (13, 0) and not (local and local.get("checked")):
-                tok, _ = _qd_token()
-                if tok and _qd_fp() is not None:
+                # cookie 路径（无需指纹）或 token+指纹路径任一就绪即可代领
+                if _qd_cookie() or (_qd_token()[0] and _qd_fp() is not None):
                     status, message, balance = _qd_try_server_claim()
-                if status in ("claimed", "token_expired"):
-                    _qd_record_server_claim(status, message, balance)
-                    if status == "claimed":
-                        today = utc8.strftime("%Y-%m-%d")
-                        if _qoder_notified.get("date") != today:
-                            _qoder_notify_claimed(balance)
-                            _qoder_notified["date"] = today
-                print("[qoder-topup] %s: %s" % (status, message))
+                    if status in ("claimed", "token_expired"):
+                        _qd_record_server_claim(status, message, balance)
+                        if status == "claimed":
+                            today = utc8.strftime("%Y-%m-%d")
+                            if _qoder_notified.get("date") != today:
+                                _qoder_notify_claimed(balance)
+                                _qoder_notified["date"] = today
+                    print("[qoder-topup] %s: %s" % (status, message))
         except Exception as e:
             print("[qoder-topup] 异常: %r" % e)
         time.sleep(1800)
@@ -1993,43 +2061,111 @@ def _qd_find_addon_remaining(obj):
     return None
 
 
-def _qd_try_server_claim():
-    """服务端代领一次（用守护推送的指纹重放）。返回 (status, message, balance)。
+class _QDExpired(Exception):
+    """Qoder 鉴权失效：via='cookie' 表示网页会话过期，via='token' 表示 dt- token 过期。"""
 
-    status: claimed=今日轮次已领（含本轮刚领/幂等重放/守护先领）
-            token_expired=服务端 token 过期；empty=指纹查询无活动（可能失效）；error=其它异常。
-    调用方须自行保证在每日 10:05(UTC+8) 之后（10:00 前 CLAIMED 是昨天轮次，不可当今日已领）。
+    def __init__(self, code, via):
+        super().__init__("Qoder 鉴权失效 HTTP %s via %s" % (code, via))
+        self.code = code
+        self.via = via
+
+
+def _qd_query_campaigns():
+    """查 CLAIM_BENEFIT 活动列表。
+
+    优先级（2026-10-20 实测结论）：
+      1) openapi token + 设备指纹重放：桌面客户端 / 服务端代领的生效路径，
+         能看到 CLAIM_BENEFIT 活动（不带指纹时 campaigns 返回空，必须带指纹）。
+      2) 网页 cookie（qoder.com）：少数活动在此可见，作为兜底。
+
+    返回 (camps, api, path)：
+      · camps：CLAIM_BENEFIT 活动对象列表（可能为空）
+      · api/path：用于后续 claim 调用的函数与路径前缀
+    鉴权失效抛 _QDExpired(code, via)；缺凭据抛 RuntimeError。
     """
     tok, _ = _qd_token()
     fp = _qd_fp()
-    if not tok or not fp:
-        return "error", "缺 token 或设备指纹", None
-    headers = _qd_fp_headers(tok, fp)
+    cookie = _qd_cookie()
 
-    def _balance():
+    # ---- 主路径：openapi token + 指纹（能查到今日活动） ----
+    if tok and fp:
         try:
-            return _qd_find_addon_remaining(_qd_api_fp("/api/v2/quota/usage", headers))
+            d = _qd_api_fp(QD_CAMPAIGN_PATH, _qd_fp_headers(tok, fp))
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise _QDExpired(e.code, "token")
+            # 非鉴权错误（网络/5xx）落到下方 cookie 兜底
+        else:
+            camps = [c for c in (d.get("campaigns") or [])
+                     if isinstance(c, dict) and c.get("actionType") == "CLAIM_BENEFIT"]
+            if camps:
+                return camps, _qd_api_fp, QD_CAMPAIGN_PATH
+
+    # ---- 兜底：网页 cookie（qoder.com） ----
+    if cookie:
+        try:
+            d = _qd_web_api(QD_WEB_CAMPAIGN_PATH)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise _QDExpired(e.code, "cookie")
+            raise
+        camps = [c for c in (d.get("campaigns") or [])
+                 if isinstance(c, dict) and c.get("actionType") == "CLAIM_BENEFIT"]
+        if camps:
+            return camps, _qd_web_api, QD_WEB_CAMPAIGN_PATH
+
+    # ---- 两条路都没查到活动 ----
+    if tok and fp:
+        # 主路径接口通但今天确实没有 CLAIM_BENEFIT 活动（活动暂停/改版）
+        return [], _qd_api_fp, QD_CAMPAIGN_PATH
+    if cookie:
+        # cookie 路通用但无活动（活动可能在桌面端，待本机守护领取）
+        raise RuntimeError("网页会话查询无活动（活动可能在桌面端，待本机守护领取）")
+    raise RuntimeError("缺 Qoder 登录态（qoder_token.txt + qoder_local_status.json 指纹，或 qoder_cookie.txt）")
+
+
+def _qd_try_server_claim():
+    """服务端代领一次（token+指纹为主，网页 cookie 兜底）。返回 (status, message, balance)。
+
+    status: claimed=今日轮次已领（含本轮刚领/幂等重放/守护先领）
+            token_expired=服务端 token 过期；empty=查询无活动；error=其它异常。
+    调用方须自行保证在每日 10:05(UTC+8) 之后（10:00 前 CLAIMED 是昨天轮次，不可当今日已领）。
+
+    2026-10-20 修正：改回「token + 指纹（openapi.qoder.sh）优先」，网页 cookie（qoder.com）
+    降为兜底——实测 CLAIM_BENEFIT 每日活动只在 openapi+指纹 这条路径出现，cookie 接口查不到。
+    """
+    def _balance():
+        """配额只在 openapi 域且必须 Bearer token；查不到返回 None（卡片显示 —，不谎报）。"""
+        try:
+            tok, _ = _qd_token()
+            if not tok:
+                return None
+            fp = _qd_fp()
+            if fp:
+                return _qd_find_addon_remaining(
+                    _qd_api_fp("/api/v2/quota/usage", _qd_fp_headers(tok, fp)))
+            return _qd_find_addon_remaining(_qd_api("/api/v2/quota/usage"))
         except Exception:
             return None
 
     try:
-        d = _qd_api_fp(QD_CAMPAIGN_PATH, headers)
+        camps, api, path = _qd_query_campaigns()
+    except _QDExpired as ex:
+        if ex.via == "cookie":
+            return ("error", "Qoder 网页 cookie 已失效(HTTP %s)，"
+                             "请重新登录 qoder.com 并复制最新 cookie" % ex.code, None)
+        return "token_expired", "服务端 API Token 已过期(HTTP %s)，请重新生成 dt- 开头 token 并更新 qoder_token.txt" % ex.code, None
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return "token_expired", "服务端 token 已过期(HTTP %s)，待本机更新" % e.code, None
         return "error", "campaigns 接口异常 HTTP %s" % e.code, None
     except Exception as e:
         return "error", "campaigns 请求失败: %s" % e, None
 
-    camps = [c for c in (d.get("campaigns") or [])
-             if isinstance(c, dict) and c.get("actionType") == "CLAIM_BENEFIT"]
     claimable = [c for c in camps if (c.get("claimStatus") or "").upper() == "CLAIMABLE"]
     if claimable:
         camp = claimable[0]
         cid = camp.get("campaignId") or ""
         try:
-            cres = _qd_api_fp("%s/%s/claim" % (QD_CAMPAIGN_PATH, cid), headers,
-                              method="POST", body={})
+            cres = api("%s/%s/claim" % (path, cid), method="POST", body={})
         except urllib.error.HTTPError as e:
             return "error", "claim 失败 HTTP %s" % e.code, None
         except Exception as e:
@@ -2042,7 +2178,7 @@ def _qd_try_server_claim():
     if camps:
         # 全部 CLAIMED：今日轮次已被领过（本机守护/桌面端/上一轮代领任一路径都算）
         return "claimed", "今日已领取（活动状态 CLAIMED）", _balance()
-    return "empty", "指纹查询无 CLAIM_BENEFIT 活动（指纹可能已失效，待本机守护刷新）", None
+    return "empty", "查询无 CLAIM_BENEFIT 活动（待本机守护刷新指纹或稍后重试）", None
 
 
 def _qd_record_server_claim(status, message, balance):
@@ -2064,6 +2200,35 @@ def _qd_record_server_claim(status, message, balance):
 
 
 def _qd_token_expired_card(code):
+    cookie = _qd_cookie()
+    rows = [
+        {"k": "原因", "v": "服务器侧 Qoder API Token 已失效（HTTP %s），约 30 天有效期到了，非配置错误" % code},
+        {"k": "如何恢复（关键）", "v": "去 Qoder 后台重新生成 dt- 开头的 API Token，再跑 python refresh_qoder_token.py <新token> 一键更新并补领今日；或直接把新 token 发小B"},
+        {"k": "为什么自动刷新不行", "v": "刷新 token 会顶掉你本机客户端的登录态，所以服务端只读不自动刷新，须手动换"},
+    ]
+    if cookie:
+        rows.insert(1, {"k": "关于你刚提供的 cookie",
+                        "v": "已收到并推到服务器（HTTP 200 能识别到你的账号）。但实测 qoder.com 网页接口不暴露每日 100 Credits 活动（返回 campaigns 为空），该活动只在 openapi + dt- token + 设备指纹 这条路径出现，所以光有 cookie 领不到，仍须换 dt- token"})
+    return {
+        "name": "qoder",
+        "title": "Qoder 每日领 100 Credits",
+        "brand": "#141414",
+        "brand2": "#4A4A4A",
+        "icon": "qd",
+        "checked": False,
+        "needs_auth": True,
+        "badge": "API Token 过期",
+        "hide_auth_link": True,
+        "auth_url": QD_AUTH_URL,
+        "metric_label": "API Token",
+        "metric_value": "已过期",
+        "last_run": _qd_read_last(),
+        "rows": rows,
+        "error": None,
+    }
+
+
+def _qd_cookie_expired_card(code):
     return {
         "name": "qoder",
         "title": "Qoder 每日领 100 Credits",
@@ -2079,9 +2244,9 @@ def _qd_token_expired_card(code):
         "metric_value": "已过期",
         "last_run": _qd_read_last(),
         "rows": [
-            {"k": "原因", "v": "服务器侧 Qoder token 已失效（HTTP %s），非配置错误" % code},
-            {"k": "如何恢复", "v": "在电脑上双击 push_qoder.bat，自动取本机 Qoder 客户端的最新 token 推上来"},
-            {"k": "为什么自动刷新不行", "v": "刷新 token 会顶掉你本机客户端的登录态，所以服务端只读不刷新"},
+            {"k": "原因", "v": "服务器侧 Qoder 网页会话 cookie 已失效（HTTP %s）" % code},
+            {"k": "如何恢复", "v": "浏览器重新登录 qoder.com → 开发者工具复制最新 cookie 覆盖 qoder_cookie.txt"},
+            {"k": "说明", "v": "cookie 走浏览器登录态，长期有效；失效只需重新复制 cookie，不用换 token"},
         ],
         "error": None,
     }
@@ -2160,7 +2325,7 @@ def _qd_window(camp):
     return True, "可领取"
 
 
-def _qd_card_from_local(local, exp):
+def _qd_card_from_local(local, exp, cookie=False):
     """用今日领取记录渲染 Qoder 卡——本机守护或服务端代领的真实结果，诚实映射。"""
     checked = bool(local.get("checked"))
     balance = local.get("balance")
@@ -2181,7 +2346,7 @@ def _qd_card_from_local(local, exp):
     if local.get("message") and checked:
         rows.append({"k": "详情", "v": str(local["message"])})
     rows.append({"k": "守护上报", "v": "%s（%s）" % (ts, local.get("last_push_via") or local.get("source") or "local_keeper")})
-    if exp:
+    if exp and not cookie:
         rows.append({"k": "登录态", "v": "有效期至 %s" % str(exp)[:10]})
     if local.get("token_expired"):
         rows.append({"k": "⚠️ 登录态", "v": "守护报告 token 已过期，请更新 qoder_token.txt"})
@@ -2203,7 +2368,8 @@ def _qd_card_from_local(local, exp):
 
 def get_qd_card():
     tok, exp = _qd_token()
-    if not tok:
+    cookie = _qd_cookie()
+    if not tok and not cookie:
         return {
             "name": "qoder",
             "title": "Qoder 每日领 100 Credits",
@@ -2219,10 +2385,12 @@ def get_qd_card():
             "metric_value": "未配置",
             "last_run": None,
             "rows": [
-                {"k": "原因", "v": "服务器上还没有 Qoder 登录态（qoder_token.txt 为空）"},
+                {"k": "原因", "v": "服务器上既没有 Qoder 网页 cookie（qoder_cookie.txt），"
+                                    "也没有 dt- token（qoder_token.txt）"},
                 {
                     "k": "如何配置",
-                    "v": "在电脑上双击 push_qoder.bat，自动从本机 Qoder 客户端取出 token 推送到服务器",
+                    "v": "浏览器登录 qoder.com → 开发者工具复制 cookie 写入 qoder_cookie.txt（推荐，永久可用）；"
+                         "或在电脑上双击 push_qoder.bat 从 Qoder 客户端取 dt- token",
                 },
             ],
             "error": None,
@@ -2231,22 +2399,22 @@ def get_qd_card():
         # ① 本机守护今日已上报 → 直接以守护数据渲染（真实领取结果，服务端无指纹查不到这些）
         local = _qd_local_today()
         if local is not None and (local.get("checked") or local.get("token_expired")):
-            return _qd_card_from_local(local, exp)
+            return _qd_card_from_local(local, exp, cookie=bool(cookie))
         # ② 服务端视角：有守护推送的指纹 → 跨机重放查询活动（只读展示，领取动作在 run/补签线程）
         utc8 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
         after_refresh = (utc8.hour, utc8.minute) >= (10, 0)  # 每日活动 10:00(UTC+8) 刷新新轮次
         fp = _qd_fp()
         lr = _qd_read_last()
-        camps = []
-        if fp is not None:
-            try:
-                d = _qd_api_fp(QD_CAMPAIGN_PATH, _qd_fp_headers(tok, fp))
-            except urllib.error.HTTPError as e2:
-                if e2.code in (401, 403):
-                    return _qd_token_expired_card(e2.code)
-                raise
-            camps = [c for c in (d.get("campaigns") or [])
-                     if isinstance(c, dict) and c.get("actionType") == "CLAIM_BENEFIT"]
+        how_text = ("🍪 网页 cookie 代领（浏览器登录态，长期有效）" if cookie
+                    else "🤖 本机守护 + ☁️ 服务端代领（指纹重放），先到先得、幂等不重复")
+        try:
+            camps, _api, _path = _qd_query_campaigns()
+        except _QDExpired as ex:
+            if ex.via == "cookie":
+                return _qd_cookie_expired_card(ex.code)
+            return _qd_token_expired_card(ex.code)
+        except urllib.error.HTTPError as e2:
+            return _card_error("qoder", "Qoder 每日领 100 Credits", "#141414", "#4A4A4A", "qd", e2)
         claimable = [c for c in camps if (c.get("claimStatus") or "").upper() == "CLAIMABLE"]
 
         if camps and after_refresh:
@@ -2258,12 +2426,12 @@ def get_qd_card():
             rows = [
                 {"k": "今日福利", "v": _qd_benefit_text(camp)},
                 {"k": "领取状态", "v": "✅ 今日已领" if checked else "⏳ 待领取（今日轮次已开放）"},
-                {"k": "领取方式", "v": "🤖 本机守护 + ☁️ 服务端代领（指纹重放），先到先得、幂等不重复"},
+                {"k": "领取方式", "v": how_text},
                 {"k": "有效期限", "v": _qd_validity_text(camp)},
             ]
             if not checked:
                 rows.append({"k": "怎么领", "v": "点卡片「一键签到」即可服务端代领；10:05 后守护/补签线程也会自动领"})
-            if exp:
+            if exp and not cookie:
                 rows.append({"k": "登录态", "v": "有效期至 %s" % str(exp)[:10]})
             if lr:
                 rows.append({"k": "上次执行", "v": "%s %s" % (
@@ -2283,22 +2451,27 @@ def get_qd_card():
                 "error": None,
             }
 
-        # ③ 诚实兜底卡：无指纹 / 未到刷新时间 / 指纹查询无活动
-        if fp is None:
-            status_txt = ("服务端暂无设备指纹，待本机守护（qoder_keeper）上报" if after_refresh
-                          else "今日轮次 10:00(UTC+8) 刷新，尚未开放")
-        elif not camps:
-            status_txt = "指纹查询无 CLAIM_BENEFIT 活动（指纹可能已失效，待本机守护刷新指纹）"
+        # ③ 诚实兜底卡：无活动 / 未到刷新时间 / 查询无活动
+        no_activity = not camps
+        if not camps:
+            if cookie:
+                status_txt = ("Qoder 网页会话有效（已识别到你的账号），但今日未下发任何可领活动——"
+                              "活动可能已暂停/改版，非签到配置故障；Qoder 恢复活动后会自动领取")
+            elif fp is None:
+                status_txt = ("服务端暂无设备指纹，待本机守护（qoder_keeper）上报" if after_refresh
+                              else "今日轮次 10:00(UTC+8) 刷新，尚未开放")
+            else:
+                status_txt = "指纹查询无 CLAIM_BENEFIT 活动（指纹可能已失效，待本机守护刷新指纹）"
         else:
             status_txt = "今日轮次 10:00(UTC+8) 刷新，尚未开放"
         rows = [
             {"k": "每日福利", "v": "100 Credits"},
-            {"k": "领取方式", "v": "🤖 本机守护 + ☁️ 服务端代领（指纹重放），先到先得、幂等不重复"},
+            {"k": "领取方式", "v": how_text},
             {"k": "当前状态", "v": status_txt},
             {"k": "说明", "v": "本机守护每 15 分钟自检并保持指纹最新；10:05 后守护/服务端任一方先跑都能领取"
                          "（claim 幂等，绝不重复发）。"},
         ]
-        if exp:
+        if exp and not cookie:
             rows.append({"k": "登录态", "v": "有效期至 %s" % str(exp)[:10]})
         stale_local = _qd_local_read()
         if stale_local and stale_local.get("date") != utc8.strftime("%Y-%m-%d"):
@@ -2311,9 +2484,9 @@ def get_qd_card():
             "brand2": "#4A4A4A",
             "icon": "qd",
             "checked": False,
-            "badge": "待领取",
+            "badge": ("今日无活动" if no_activity else "待领取"),
             "metric_label": "今日 Credits",
-            "metric_value": "待领取",
+            "metric_value": ("今日无活动" if no_activity else "待领取"),
             "last_run": lr,
             "rows": rows,
             "error": None,
@@ -2339,8 +2512,9 @@ def run_qd_checkin():
     本函数（一键签到/每日定时轮触发）执行 ②；补签线程 _qoder_topup_loop 亦执行 ②。
     """
     tok, _ = _qd_token()
-    if not tok:
-        raise RuntimeError("未配置 Qoder 登录态（qoder_token.txt 或 QODER_TOKEN）")
+    cookie = _qd_cookie()
+    if not tok and not cookie:
+        raise RuntimeError("未配置 Qoder 登录态（qoder_token.txt / QODER_TOKEN 或 qoder_cookie.txt / QODER_COOKIE）")
     local = _qd_local_today()
     if local and local.get("checked"):
         return get_qd_card()  # 今日已领（守护先到或此前已代领）
@@ -2349,7 +2523,8 @@ def run_qd_checkin():
         # 10:00 前接口挂着昨天轮次的 CLAIMED，不可当今日已领；10:05 后由守护/补签线程代领
         _qd_record(False, "今日轮次 10:00(UTC+8) 刷新未到；10:05 后本机守护/服务端自动代领")
         return get_qd_card()
-    if _qd_fp() is None:
+    # cookie 路径无需设备指纹，直接代领；token 路径需守护上报指纹
+    if not cookie and _qd_fp() is None:
         _qd_record(False, "服务端暂无设备指纹（qoder_keeper 尚未上报），待本机守护领取")
         return get_qd_card()
     status, message, balance = _qd_try_server_claim()
@@ -4453,6 +4628,44 @@ def _cred_trae_expiry():
     return None, None
 
 
+def _cred_doubao_expiry():
+    """豆包：签名器上传的完整 cookie 数组里带 expires（登录后约 30 天）。
+
+    优先读 upload-cookie 落盘的 doubao_cookies_server.json，再退回本机
+    doubao_cookie.json（trae 式导出）。只认 doubao.com 域的关键会话 cookie，
+    取最早到期（短板效应）；全是 session cookie（expires<=0）时返回未知。
+    """
+    KEY = ("sessionid", "sessionid_ss", "sid_tt", "uid_tt", "sid_guard")
+    best = None
+    for fn in ("doubao_cookies_server.json", "doubao_cookie.json"):
+        raw = _cred_read_text(os.path.join(BASE_DIR, fn))
+        if not raw:
+            continue
+        try:
+            arr = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(arr, list):
+            continue
+        for c in arr:
+            if not isinstance(c, dict):
+                continue
+            dom = str(c.get("domain", "")).lower()
+            if dom != "doubao.com" and not dom.endswith(".doubao.com"):
+                continue
+            nm = str(c.get("name", "")).lower()
+            if nm not in KEY:
+                continue
+            ts = _cred_parse_ts(c.get("expires"))
+            if ts and (best is None or ts < best[0]):
+                best = (ts, "Cookie " + str(c.get("name")))
+        if best:
+            break
+    if best:
+        return best[0], best[1]
+    return None, None
+
+
 def _cred_expiry_raw(name):
     """取平台「最原始的凭据文本」，交给 _cred_expiry_from_text 解析。
 
@@ -4504,13 +4717,12 @@ def _cred_expiry_from_text(raw):
 def cred_expiry(name):
     """返回平台凭据到期信息 dict；**算不出来一律返回 None**（网页显示「未知」）。
 
-    字段：
-      days(float)/d(int)   剩余天数（可能为负，负=已过期）
-      at(str)              "MM-DD HH:mm" 到期时刻
-      basis(str)           判断依据，如 "JWT exp" / "token.info expiresAt"
-      level(str)           ok / soon / urgent / expired
-      label(str)           给卡片用的中文说明，如 "还剩 5 天"
+    2026-10-19：Qoder 现在以网页 cookie 为活动鉴权（长期有效，无需月月换 token）。
+    只要存在 cookie，就跳过 dt- token 的 expiresAt 预警（cookie 才是生效的凭据，
+    且其存活期不定时、无需展示一个会误导人的「不足 N 天」红色告警）。
     """
+    if name == "qoder" and _qd_cookie():
+        return None
     ts, basis = None, None
     try:
         if name == "workbuddy":
@@ -4525,6 +4737,8 @@ def cred_expiry(name):
                 ts = None
         if ts is None and name == "trae":
             ts, basis = _cred_trae_expiry()
+        if ts is None and name == "doubao":
+            ts, basis = _cred_doubao_expiry()
         if ts is None:
             ts, basis = _cred_expiry_from_text(_cred_expiry_raw(name))
         if ts is None:
